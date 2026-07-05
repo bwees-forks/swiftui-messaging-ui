@@ -1720,11 +1720,46 @@ final class TiledUIView<
     guard position.version > lastAppliedScrollVersion else { return }
     lastAppliedScrollVersion = position.version
 
+    if let itemID = position.itemID {
+      scrollToItem(id: itemID, anchor: position.itemAnchor, animated: position.animated)
+      return
+    }
+
     guard let edge = position.edge else { return }
 
     scrollTo(edge: edge, animated: position.animated)
   }
-  
+
+  /// Scrolls so the item matching `id` is positioned at `anchor` within the viewport.
+  ///
+  /// Resolves the id against the current `items`, reads the target frame from the
+  /// tiled layout (the authoritative position in the virtual content space), converts
+  /// it to a content offset for the requested anchor, clamps to the scrollable bounds,
+  /// and drives the same spring animator used by edge scrolling. Native
+  /// `scrollToItem(at:)` is avoided because the layout pins content with a negative
+  /// content inset, which its target-offset math does not account for.
+  private func scrollToItem(id: AnyHashable, anchor: UnitPoint, animated: Bool) {
+    guard let index = items.firstIndex(where: { AnyHashable($0.id) == id }) else { return }
+
+    collectionView.layoutIfNeeded()
+
+    let indexPath = DisplaySection.messages.indexPath(item: index)
+    guard let attributes = tiledLayout.layoutAttributesForItem(at: indexPath) else { return }
+
+    let inset = collectionView.adjustedContentInset
+    let visibleHeight = collectionView.bounds.height - inset.top - inset.bottom
+    let frame = attributes.frame
+
+    let anchorInContent = frame.minY + frame.height * anchor.y
+    let anchorInViewport = inset.top + visibleHeight * anchor.y
+    let desiredOffsetY = anchorInContent - anchorInViewport
+
+    let bounds = scrollableContentOffsetBounds()
+    let clampedOffsetY = min(max(desiredOffsetY, bounds.min), bounds.max)
+
+    scrollToContentOffsetY(clampedOffsetY, animated: animated)
+  }
+
   private func scrollTo(edge: TiledScrollPosition.Edge, animated: Bool) {
     isUserScrollSessionActive = false
 

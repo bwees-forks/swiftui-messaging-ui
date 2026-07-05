@@ -1,3 +1,5 @@
+import SwiftUI
+
 /// Controls scroll position in TiledView.
 ///
 /// Use this struct to programmatically scroll to edges and configure auto-scroll behavior.
@@ -36,7 +38,7 @@
 ///   scrollPosition.autoScrollsToBottomOnAppend = geometry.pointsFromBottom < 100
 /// }
 /// ```
-public struct TiledScrollPosition: Equatable, Sendable {
+public struct TiledScrollPosition: Equatable, @unchecked Sendable {
 
   /// The edge to scroll to.
   public enum Edge: Equatable, Sendable {
@@ -48,6 +50,15 @@ public struct TiledScrollPosition: Equatable, Sendable {
 
   /// The target edge for the next scroll action.
   var edge: Edge?
+
+  /// The target item id for the next scroll action, set when scrolling to a
+  /// specific item rather than an edge. Type-erased because `TiledScrollPosition`
+  /// is not generic over the item type.
+  var itemID: AnyHashable?
+
+  /// Where the target item should land within the viewport. Only meaningful
+  /// when `itemID` is set.
+  var itemAnchor: UnitPoint = .center
 
   /// Whether the scroll should be animated.
   var animated: Bool = true
@@ -94,6 +105,26 @@ public struct TiledScrollPosition: Equatable, Sendable {
   ///   - animated: Whether to animate the scroll. Defaults to `true`.
   public mutating func scrollTo(edge: Edge, animated: Bool = true) {
     self.edge = edge
+    self.itemID = nil
+    self.animated = animated
+    makeDirty()
+  }
+
+  /// Scrolls so the item whose `id` matches the given value is positioned at
+  /// `anchor` within the viewport.
+  ///
+  /// The item must currently be present in the `items` array passed to
+  /// ``TiledView``; ids that are not loaded are ignored. Page the target in
+  /// before calling if it may be off the loaded window.
+  ///
+  /// - Parameters:
+  ///   - id: The `id` of the target item (matched against `Item.ID`).
+  ///   - anchor: Where the item should land vertically. Defaults to `.center`.
+  ///   - animated: Whether to animate the scroll. Defaults to `true`.
+  public mutating func scrollTo(id: some Hashable, anchor: UnitPoint = .center, animated: Bool = true) {
+    self.edge = nil
+    self.itemID = AnyHashable(id)
+    self.itemAnchor = anchor
     self.animated = animated
     makeDirty()
   }
