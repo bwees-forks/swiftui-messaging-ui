@@ -1739,12 +1739,45 @@ final class TiledUIView<
   /// `scrollToItem(at:)` is avoided because the layout pins content with a negative
   /// content inset, which its target-offset math does not account for.
   private func scrollToItem(id: AnyHashable, anchor: UnitPoint, animated: Bool) {
-    guard let index = items.firstIndex(where: { AnyHashable($0.id) == id }) else { return }
+    guard items.contains(where: { AnyHashable($0.id) == id }) else { return }
 
     collectionView.layoutIfNeeded()
 
+    guard animated else {
+      if let target = itemContentOffsetY(id: id, anchor: anchor) {
+        scrollToContentOffsetY(target, animated: false)
+      }
+      return
+    }
+
+    isUserScrollSessionActive = false
+    springAnimator?.stop(finished: false)
+    collectionView.setContentOffset(collectionView.contentOffset, animated: false)
+
+    // Cells above the target are still estimated at tap time, so its true offset
+    // shifts as they materialize during the scroll. Re-resolve it every frame (like
+    // edge scrolling) so the spring converges on the real position instead of
+    // locking onto a stale estimate and stopping short of the target.
+    let animator = SpringScrollAnimator()
+    springAnimator = animator
+    animator.animate(scrollView: collectionView) { [weak self] scrollView in
+      guard let target = self?.itemContentOffsetY(id: id, anchor: anchor) else {
+        return SpringScrollAnimator.TargetResult(target: scrollView.contentOffset.y, shouldStop: true)
+      }
+      let shouldStop = abs(target - scrollView.contentOffset.y) < 0.5
+      return SpringScrollAnimator.TargetResult(target: target, shouldStop: shouldStop)
+    }
+  }
+
+  /// Content offset that positions the item matching `id` at `anchor`, clamped to
+  /// the scrollable bounds. Re-resolves layout attributes on each call so it can be
+  /// re-evaluated as self-sizing cells settle. Returns nil if the id is no longer
+  /// present or the layout has no attributes for it yet.
+  private func itemContentOffsetY(id: AnyHashable, anchor: UnitPoint) -> CGFloat? {
+    guard let index = items.firstIndex(where: { AnyHashable($0.id) == id }) else { return nil }
+
     let indexPath = DisplaySection.messages.indexPath(item: index)
-    guard let attributes = tiledLayout.layoutAttributesForItem(at: indexPath) else { return }
+    guard let attributes = tiledLayout.layoutAttributesForItem(at: indexPath) else { return nil }
 
     let inset = collectionView.adjustedContentInset
     let visibleHeight = collectionView.bounds.height - inset.top - inset.bottom
@@ -1755,9 +1788,7 @@ final class TiledUIView<
     let desiredOffsetY = anchorInContent - anchorInViewport
 
     let bounds = scrollableContentOffsetBounds()
-    let clampedOffsetY = min(max(desiredOffsetY, bounds.min), bounds.max)
-
-    scrollToContentOffsetY(clampedOffsetY, animated: animated)
+    return min(max(desiredOffsetY, bounds.min), bounds.max)
   }
 
   private func scrollTo(edge: TiledScrollPosition.Edge, animated: Bool) {
