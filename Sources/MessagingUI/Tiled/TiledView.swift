@@ -1739,74 +1739,29 @@ final class TiledUIView<
   /// `scrollToItem(at:)` is avoided because the layout pins content with a negative
   /// content inset, which its target-offset math does not account for.
   private func scrollToItem(id: AnyHashable, anchor: UnitPoint, animated: Bool) {
-    guard items.contains(where: { AnyHashable($0.id) == id }) else { return }
-
-    collectionView.layoutIfNeeded()
-
-    guard animated else {
-      if let target = itemContentOffsetY(id: id, anchor: anchor) {
-        scrollToContentOffsetY(target, animated: false)
-      }
-      return
-    }
+    guard let index = items.firstIndex(where: { AnyHashable($0.id) == id }) else { return }
 
     isUserScrollSessionActive = false
     springAnimator?.stop(finished: false)
     collectionView.setContentOffset(collectionView.contentOffset, animated: false)
 
-    // Off-screen cells are self-sized from a fixed estimate, so the target's true
-    // offset is unknown until it is measured — and it is only measured once it
-    // scrolls into view. A single spring to the estimated offset therefore settles
-    // a page short (or past) the target. Instead drive toward the content edge on
-    // the target's side — its direction comes from the item's index versus the
-    // visible range, which needs no height estimate — so cells keep materializing,
-    // then retarget precisely the moment the cell is laid out.
-    let animator = SpringScrollAnimator()
-    springAnimator = animator
-    animator.animate(scrollView: collectionView) { [weak self] scrollView in
-      guard let self,
-            let index = self.items.firstIndex(where: { AnyHashable($0.id) == id }) else {
-        return SpringScrollAnimator.TargetResult(target: scrollView.contentOffset.y, shouldStop: true)
-      }
+    // When the whole conversation fits on screen the item is already visible, and
+    // the layout pins content with a negative inset that UIKit's scrollToItem math
+    // mishandles — so there is nothing to do and native scrolling could jump oddly.
+    let scrollBounds = scrollableContentOffsetBounds()
+    guard scrollBounds.max > scrollBounds.min else { return }
 
-      let indexPath = DisplaySection.messages.indexPath(item: index)
-      let current = scrollView.contentOffset.y
-      let bounds = self.scrollableContentOffsetBounds()
-
-      if self.collectionView.indexPathsForVisibleItems.contains(indexPath),
-         let target = self.itemContentOffsetY(id: id, anchor: anchor) {
-        return SpringScrollAnimator.TargetResult(target: target, shouldStop: abs(target - current) < 0.5)
-      }
-
-      let visibleItems = self.collectionView.indexPathsForVisibleItems
-        .filter { $0.section == indexPath.section }
-        .map(\.item)
-      let goUp = visibleItems.min().map { index < $0 } ?? (current > bounds.min)
-      let edge = goUp ? bounds.min : bounds.max
-      return SpringScrollAnimator.TargetResult(target: edge, shouldStop: abs(edge - current) < 0.5)
+    // Let UICollectionView drive the scroll: it walks the estimated layout toward
+    // the target, self-sizing and compensating as cells materialize, and terminates
+    // on its own — which the custom offset math cannot do reliably when the cells
+    // between here and the target are still estimated.
+    let position: UICollectionView.ScrollPosition = switch anchor.y {
+    case ..<0.34: .top
+    case 0.66...: .bottom
+    default: .centeredVertically
     }
-  }
-
-  /// Content offset that positions the item matching `id` at `anchor`, clamped to
-  /// the scrollable bounds. Re-resolves layout attributes on each call so it can be
-  /// re-evaluated as self-sizing cells settle. Returns nil if the id is no longer
-  /// present or the layout has no attributes for it yet.
-  private func itemContentOffsetY(id: AnyHashable, anchor: UnitPoint) -> CGFloat? {
-    guard let index = items.firstIndex(where: { AnyHashable($0.id) == id }) else { return nil }
-
     let indexPath = DisplaySection.messages.indexPath(item: index)
-    guard let attributes = tiledLayout.layoutAttributesForItem(at: indexPath) else { return nil }
-
-    let inset = collectionView.adjustedContentInset
-    let visibleHeight = collectionView.bounds.height - inset.top - inset.bottom
-    let frame = attributes.frame
-
-    let anchorInContent = frame.minY + frame.height * anchor.y
-    let anchorInViewport = inset.top + visibleHeight * anchor.y
-    let desiredOffsetY = anchorInContent - anchorInViewport
-
-    let bounds = scrollableContentOffsetBounds()
-    return min(max(desiredOffsetY, bounds.min), bounds.max)
+    collectionView.scrollToItem(at: indexPath, at: position, animated: animated)
   }
 
   private func scrollTo(edge: TiledScrollPosition.Edge, animated: Bool) {
