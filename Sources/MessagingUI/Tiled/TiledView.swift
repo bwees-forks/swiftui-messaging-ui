@@ -1754,18 +1754,36 @@ final class TiledUIView<
     springAnimator?.stop(finished: false)
     collectionView.setContentOffset(collectionView.contentOffset, animated: false)
 
-    // Cells above the target are still estimated at tap time, so its true offset
-    // shifts as they materialize during the scroll. Re-resolve it every frame (like
-    // edge scrolling) so the spring converges on the real position instead of
-    // locking onto a stale estimate and stopping short of the target.
+    // Off-screen cells are self-sized from a fixed estimate, so the target's true
+    // offset is unknown until it is measured — and it is only measured once it
+    // scrolls into view. A single spring to the estimated offset therefore settles
+    // a page short (or past) the target. Instead drive toward the content edge on
+    // the target's side — its direction comes from the item's index versus the
+    // visible range, which needs no height estimate — so cells keep materializing,
+    // then retarget precisely the moment the cell is laid out.
     let animator = SpringScrollAnimator()
     springAnimator = animator
     animator.animate(scrollView: collectionView) { [weak self] scrollView in
-      guard let target = self?.itemContentOffsetY(id: id, anchor: anchor) else {
+      guard let self,
+            let index = self.items.firstIndex(where: { AnyHashable($0.id) == id }) else {
         return SpringScrollAnimator.TargetResult(target: scrollView.contentOffset.y, shouldStop: true)
       }
-      let shouldStop = abs(target - scrollView.contentOffset.y) < 0.5
-      return SpringScrollAnimator.TargetResult(target: target, shouldStop: shouldStop)
+
+      let indexPath = DisplaySection.messages.indexPath(item: index)
+      let current = scrollView.contentOffset.y
+      let bounds = self.scrollableContentOffsetBounds()
+
+      if self.collectionView.indexPathsForVisibleItems.contains(indexPath),
+         let target = self.itemContentOffsetY(id: id, anchor: anchor) {
+        return SpringScrollAnimator.TargetResult(target: target, shouldStop: abs(target - current) < 0.5)
+      }
+
+      let visibleItems = self.collectionView.indexPathsForVisibleItems
+        .filter { $0.section == indexPath.section }
+        .map(\.item)
+      let goUp = visibleItems.min().map { index < $0 } ?? (current > bounds.min)
+      let edge = goUp ? bounds.min : bounds.max
+      return SpringScrollAnimator.TargetResult(target: edge, shouldStop: abs(edge - current) < 0.5)
     }
   }
 
