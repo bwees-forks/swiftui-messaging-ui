@@ -1149,16 +1149,20 @@ final class TiledUIView<
   override func layoutSubviews() {
     super.layoutSubviews()
     updateHiddenEdgeContentInset()
-    
-    // Execute any pending actions after layout
+
+    // Execute any pending actions synchronously within this layout pass. These
+    // include the initial scroll-to-bottom on replace; applying it here — in the
+    // same transaction as the reload, rather than deferring a runloop — means the
+    // first paint is already at the bottom instead of briefly showing the
+    // pre-scroll (top) position for one frame. Deferral to layoutSubviews (over
+    // an inline scroll in `.replace`) is retained so bounds and content size are
+    // valid before scrolling.
+    guard !pendingActionsOnLayoutSubviews.isEmpty else { return }
     let actions = pendingActionsOnLayoutSubviews
     pendingActionsOnLayoutSubviews.removeAll()
-    DispatchQueue.main.async {
-      for action in actions {
-        action()
-      }
+    for action in actions {
+      action()
     }
-
   }
 
   private func applyChange(
