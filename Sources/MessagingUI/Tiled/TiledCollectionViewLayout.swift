@@ -232,10 +232,74 @@ public final class TiledCollectionViewLayout: UICollectionViewLayout {
     let newHeight = preferredAttributes.frame.size.height
 
     if preferredAttributes.representedElementCategory == .cell {
-      updateItemHeightForSelfSizing(at: preferredAttributes.indexPath, newHeight: newHeight)
+      let indexPath = preferredAttributes.indexPath
+      if let adjustment = selfSizingContentOffsetAdjustment(at: indexPath, newHeight: newHeight) {
+        context.contentOffsetAdjustment.y = adjustment
+      }
+      updateItemHeightForSelfSizing(at: indexPath, newHeight: newHeight)
     }
 
     return context
+  }
+
+  /// Distance from the content bottom (in points) within which a self-sizing
+  /// message keeps the list pinned to the bottom. Matches the near-bottom
+  /// threshold used for auto-scroll elsewhere in the view.
+  private let selfSizingBottomPinThreshold: CGFloat = 100
+
+  /// Content-offset compensation for a message cell that self-sizes after its
+  /// content resolves (e.g. an async link preview or image expands the bubble).
+  ///
+  /// The messages section grows top-fixed: `updateItemHeight` keeps the resized
+  /// item's origin and pushes everything below it down by the height delta. On
+  /// its own that lets a bubble grow *past* the bottom of the screen when the
+  /// user is already at the bottom, and shoves the viewport down when the
+  /// resized bubble sits above it. A matching `contentOffsetAdjustment` keeps the
+  /// visible anchor stable:
+  /// - Near the bottom: follow the growth so the list stays pinned to the bottom
+  ///   and older content flows upward off the top.
+  /// - Resized bubble entirely above the viewport: shift by the delta so the
+  ///   reading position does not jump.
+  /// - Resized bubble within/below the viewport: no adjustment; it grows in place.
+  ///
+  /// Returns `nil` for non-message sections and during batch updates, both of
+  /// which keep their existing position-preservation behavior.
+  private func selfSizingContentOffsetAdjustment(
+    at indexPath: IndexPath,
+    newHeight: CGFloat
+  ) -> CGFloat? {
+    guard batchUpdateMetrics == nil,
+          let collectionView,
+          DisplaySection(rawValue: indexPath.section) == .messages,
+          let item = currentItemMetrics().item(at: indexPath) else { return nil }
+
+    let heightDiff = newHeight - item.height
+    guard heightDiff != 0 else { return nil }
+
+    let nearBottom = collectionView.tiledScrollGeometry.pointsFromBottom < selfSizingBottomPinThreshold
+    let viewportTop = collectionView.contentOffset.y + additionalContentInset.top
+    let resizedItemBottom = item.yPosition + item.height
+
+    return Self.selfSizingContentOffsetAdjustment(
+      heightDiff: heightDiff,
+      resizedItemBottom: resizedItemBottom,
+      viewportTop: viewportTop,
+      nearBottom: nearBottom
+    )
+  }
+
+  /// Pure decision for how far to shift `contentOffset` when a message bubble
+  /// self-sizes by `heightDiff`, given where its old bottom edge (`resizedItemBottom`)
+  /// sits relative to the top of the visible viewport (`viewportTop`) and whether
+  /// the list is currently pinned near the bottom. All values are in content
+  /// coordinates (the space shared by item frames and `contentOffset`).
+  static func selfSizingContentOffsetAdjustment(
+    heightDiff: CGFloat,
+    resizedItemBottom: CGFloat,
+    viewportTop: CGFloat,
+    nearBottom: Bool
+  ) -> CGFloat {
+    (nearBottom || resizedItemBottom <= viewportTop) ? heightDiff : 0
   }
 
   // MARK: - Batch Update Hooks
