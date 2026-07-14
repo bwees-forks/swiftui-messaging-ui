@@ -331,6 +331,14 @@ extension Optional where Wrapped == HeaderContent<Never> {
 
 // MARK: - TiledUIView
 
+/// A one-shot target for the initial scroll position of the first non-empty
+/// snapshot. A nil target positions at the bottom; a resolved target lands the
+/// item at `anchor` within the viewport.
+struct TiledInitialScrollTarget {
+  let id: AnyHashable
+  let anchor: UnitPoint
+}
+
 final class TiledUIView<
   Item: Identifiable & Equatable,
   Cell: View,
@@ -452,6 +460,15 @@ final class TiledUIView<
 
   /// Scroll to bottom on setItems (initial load)
   var scrollsToBottomOnReplace: Bool = false
+
+  /// One-shot initial scroll target consumed by the first non-empty snapshot.
+  /// Nil positions at the bottom via `scrollsToBottomOnReplace`.
+  var initialScrollTarget: TiledInitialScrollTarget?
+
+  /// True once the first non-empty snapshot has positioned the content. Gates the
+  /// one-shot target jump and withholds scroll-geometry reports until the resting
+  /// position is set, so stale pre-position offsets are not published.
+  private var hasAppliedInitialPositioning: Bool = false
 
   /// Scroll geometry change callback
   var onTiledScrollGeometryChange: ((TiledScrollGeometry) -> Void)?
@@ -611,7 +628,9 @@ final class TiledUIView<
     if #available(iOS 18, *) {
       // context.animate {} in UIViewRepresentable handles animation asynchronously
       applyChanges()
-      onTiledScrollGeometryChange?(finalGeometry)
+      if hasAppliedInitialPositioning {
+        onTiledScrollGeometryChange?(finalGeometry)
+      }
     } else {
       UIView.animate(
         withDuration: 0.5,
@@ -620,6 +639,7 @@ final class TiledUIView<
       ) {
         applyChanges()
       } completion: { _ in
+        guard self.hasAppliedInitialPositioning else { return }
         self.onTiledScrollGeometryChange?(finalGeometry)
       }
     }
@@ -1097,7 +1117,14 @@ final class TiledUIView<
     }
 
     if !hasAppliedItemSnapshot {
-      hasAppliedItemSnapshot = true
+      // The first non-empty snapshot is the positioning snapshot. A cold open can
+      // deliver an empty first snapshot (coordinator messages fill synchronously
+      // while render-state items build off-main); applying it must not consume the
+      // one-shot initial position. Render the empty snapshot without marking it
+      // applied so the next non-empty snapshot positions.
+      if !newItems.isEmpty {
+        hasAppliedItemSnapshot = true
+      }
       isApplyingItemChanges = true
       applyChange(.replace(newItems)) { [weak self] in
         guard let self else { return }
@@ -1178,12 +1205,9 @@ final class TiledUIView<
       collectionView.reloadData()
       updateHiddenEdgeContentInset()
 
-      pendingActionsOnLayoutSubviews.append { [weak self, scrollsToBottomOnReplace] in
+      pendingActionsOnLayoutSubviews.append { [weak self] in
         guard let self else { return }
-        
-        if scrollsToBottomOnReplace {
-          scrollTo(edge: .bottom, animated: false)
-        }
+        self.applyInitialPositioning()
       }
       setNeedsLayout()
       completion()
@@ -1597,6 +1621,9 @@ final class TiledUIView<
 
   private func notifyScrollGeometry() {
     guard let onTiledScrollGeometryChange else { return }
+    // Withhold reports until the first positioning pass sets the resting offset;
+    // pre-position offsets read as an oversized distance from the bottom.
+    guard hasAppliedInitialPositioning else { return }
     let geometry = TiledScrollGeometry(
       contentOffset: collectionView.contentOffset,
       contentSize: collectionView.contentSize,
@@ -1847,6 +1874,66 @@ final class TiledUIView<
       collectionView.contentSize.height - collectionView.bounds.height + inset.bottom
     )
     return (minOffsetY, maxOffsetY)
+  }
+
+  /// Positions the content for the first non-empty snapshot: to the initial
+  /// scroll target when one resolves, otherwise the bottom pin. Runs inside a
+  /// layout pass so bounds and content size are valid. An empty snapshot defers
+  /// positioning so the one-shot target and geometry suppression survive to the
+  /// first non-empty snapshot.
+  private func applyInitialPositioning() {
+    guard !items.isEmpty else { return }
+    // Emit one report from the resting position so observers can derive their
+    // follow state; the positioning offset write fires scrollViewDidScroll while
+    // reports are still withheld, and an offset-preserving append never will.
+    defer {
+      hasAppliedInitialPositioning = true
+      notifyScrollGeometry()
+    }
+
+    if !hasAppliedInitialPositioning,
+       let target = initialScrollTarget,
+       let index = items.firstIndex(where: { AnyHashable($0.id) == target.id }) {
+      positionInitialTarget(at: index, anchor: target.anchor)
+      return
+    }
+
+    if scrollsToBottomOnReplace {
+      scrollTo(edge: .bottom, animated: false)
+    }
+  }
+
+  /// Sets `contentOffset` so the item at `index` rests at `anchor` within the
+  /// viewport, computed directly from the item's layout attributes and clamped to
+  /// the scrollable bounds. Direct offset math is used rather than
+  /// `scrollToItem(at:)` because the layout pins content with a negative inset the
+  /// native target-offset math mishandles, and because this runs inside a layout
+  /// pass where a reentrant native scroll is unsafe.
+  private func positionInitialTarget(at index: Int, anchor: UnitPoint) {
+    // Resolve pending self-sizing heights before reading layout attributes;
+    // first-mount metrics can be width-0 estimates until prepare() runs.
+    collectionView.layoutIfNeeded()
+
+    let indexPath = DisplaySection.messages.indexPath(item: index)
+    guard let attributes = tiledLayout.layoutAttributesForItem(at: indexPath) else {
+      if scrollsToBottomOnReplace {
+        scrollTo(edge: .bottom, animated: false)
+      }
+      return
+    }
+
+    // The content inset carries the virtual-space pinning (a large negative
+    // top), so it cannot serve as viewport chrome here; additionalContentInset
+    // holds the real chrome, including the SwiftUI safe area and keyboard.
+    let chrome = tiledLayout.additionalContentInset
+    let visibleHeight = collectionView.bounds.height - chrome.top - chrome.bottom
+    let anchoredOffsetY = attributes.frame.minY
+      + anchor.y * attributes.frame.height
+      - chrome.top
+      - anchor.y * visibleHeight
+
+    let bounds = scrollableContentOffsetBounds()
+    collectionView.contentOffset.y = min(max(anchoredOffsetY, bounds.min), bounds.max)
   }
 
   private func scrollToContentOffsetY(
@@ -2317,6 +2404,7 @@ struct TiledViewRepresentable<
   let appendLoader: Loader<AppendLoadingView>?
   let typingIndicator: TypingIndicator<TypingIndicatorContent>?
   let headerContent: HeaderContent<HeaderContentView>?
+  let initialScrollTarget: TiledInitialScrollTarget?
   @Binding var scrollPosition: TiledScrollPosition
 
   init(
@@ -2333,6 +2421,7 @@ struct TiledViewRepresentable<
     appendLoader: Loader<AppendLoadingView>?,
     typingIndicator: TypingIndicator<TypingIndicatorContent>?,
     headerContent: HeaderContent<HeaderContentView>?,
+    initialScrollTarget: TiledInitialScrollTarget? = nil,
     cellBuilder: @escaping (Item, CellReveal?, CellStateStorage<StateValue>) -> Cell
   ) {
     self.items = items
@@ -2348,6 +2437,7 @@ struct TiledViewRepresentable<
     self.appendLoader = appendLoader
     self.typingIndicator = typingIndicator
     self.headerContent = headerContent
+    self.initialScrollTarget = initialScrollTarget
     self.cellBuilder = cellBuilder
   }
 
@@ -2388,6 +2478,9 @@ struct TiledViewRepresentable<
     uiView.setTypingIndicator(typingIndicator)
     uiView.setHeaderContent(headerContent)
 
+    // Refresh the one-shot initial target before applying items so target and
+    // items stay in lockstep for the positioning snapshot.
+    uiView.initialScrollTarget = initialScrollTarget
     uiView.applyItems(items)
     uiView.applyScrollPosition(scrollPosition)
   }
@@ -2565,6 +2658,7 @@ public struct TiledView<
   let appendLoader: Loader<AppendLoadingView>?
   let typingIndicator: TypingIndicator<TypingIndicatorContent>?
   let headerContent: HeaderContent<HeaderContentView>?
+  var initialScrollTarget: TiledInitialScrollTarget?
   @Binding var scrollPosition: TiledScrollPosition
 
   /// Internal initializer for creating TiledView with all parameters (used by modifiers)
@@ -2581,6 +2675,7 @@ public struct TiledView<
     appendLoader: Loader<AppendLoadingView>?,
     typingIndicator: TypingIndicator<TypingIndicatorContent>?,
     headerContent: HeaderContent<HeaderContentView>?,
+    initialScrollTarget: TiledInitialScrollTarget? = nil,
     scrollPosition: Binding<TiledScrollPosition>
   ) {
     self.items = items
@@ -2595,6 +2690,7 @@ public struct TiledView<
     self.appendLoader = appendLoader
     self.typingIndicator = typingIndicator
     self.headerContent = headerContent
+    self.initialScrollTarget = initialScrollTarget
     self._scrollPosition = scrollPosition
   }
 }
@@ -2689,6 +2785,7 @@ extension TiledView where PrependLoadingView == Never {
       appendLoader: appendLoader,
       typingIndicator: typingIndicator,
       headerContent: headerContent,
+      initialScrollTarget: initialScrollTarget,
       scrollPosition: $scrollPosition
     )
   }
@@ -2713,6 +2810,7 @@ extension TiledView where AppendLoadingView == Never {
       appendLoader: loader,
       typingIndicator: typingIndicator,
       headerContent: headerContent,
+      initialScrollTarget: initialScrollTarget,
       scrollPosition: $scrollPosition
     )
   }
@@ -2737,6 +2835,7 @@ extension TiledView where TypingIndicatorContent == Never {
       appendLoader: appendLoader,
       typingIndicator: indicator,
       headerContent: headerContent,
+      initialScrollTarget: initialScrollTarget,
       scrollPosition: $scrollPosition
     )
   }
@@ -2761,6 +2860,7 @@ extension TiledView where HeaderContentView == Never {
       appendLoader: appendLoader,
       typingIndicator: typingIndicator,
       headerContent: header,
+      initialScrollTarget: initialScrollTarget,
       scrollPosition: $scrollPosition
     )
   }
@@ -2786,6 +2886,7 @@ extension TiledView {
         appendLoader: appendLoader,
         typingIndicator: typingIndicator,
         headerContent: headerContent,
+        initialScrollTarget: initialScrollTarget,
         cellBuilder: cellBuilder
       )
       .ignoresSafeArea()
@@ -2796,6 +2897,18 @@ extension TiledView {
     _ action: @escaping (TiledScrollGeometry) -> Void
   ) -> Self {
     self.onTiledScrollGeometryChange = action
+    return self
+  }
+
+  /// Sets a one-shot initial scroll target applied by the first non-empty
+  /// snapshot. A nil id positions at the bottom (the default); a resolved id
+  /// lands that item at `anchor` within the viewport. The target is consumed
+  /// once, after which appends and replaces follow the normal scroll behavior.
+  public consuming func initialScrollTarget(
+    id: AnyHashable?,
+    anchor: UnitPoint = .center
+  ) -> Self {
+    self.initialScrollTarget = id.map { TiledInitialScrollTarget(id: $0, anchor: anchor) }
     return self
   }
 
