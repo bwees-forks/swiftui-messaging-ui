@@ -337,6 +337,16 @@ extension Optional where Wrapped == HeaderContent<Never> {
 struct TiledInitialScrollTarget {
   let id: AnyHashable
   let anchor: UnitPoint
+  /// When true, the resolved target arms an anchor window that re-pins the item
+  /// through late self-sizing and chrome/bounds changes until the first user drag
+  /// or programmatic scroll. When false, the target is positioned one-shot.
+  let holdUntilUserScroll: Bool
+
+  init(id: AnyHashable, anchor: UnitPoint, holdUntilUserScroll: Bool = true) {
+    self.id = id
+    self.anchor = anchor
+    self.holdUntilUserScroll = holdUntilUserScroll
+  }
 }
 
 final class TiledUIView<
@@ -470,6 +480,19 @@ final class TiledUIView<
   /// position is set, so stale pre-position offsets are not published.
   private var hasAppliedInitialPositioning: Bool = false
 
+  /// Active initial-anchor window. When set, the stored target is re-pinned
+  /// through late self-sizing and chrome/bounds changes instead of drifting. The
+  /// id is re-resolved to the current index on each use so prepends and inserts
+  /// that shift indices are tracked. Released on the first user drag or any
+  /// programmatic scroll command.
+  private var activeInitialAnchor: TiledInitialScrollTarget?
+
+  /// Whether the initial-anchor window is currently holding a target.
+  var isInitialAnchorActive: Bool { activeInitialAnchor != nil }
+
+  /// Bounds size at the last layout pass, used to re-pin the anchor on rotation.
+  private var lastLaidOutBoundsSize: CGSize = .zero
+
   /// Scroll geometry change callback
   var onTiledScrollGeometryChange: ((TiledScrollGeometry) -> Void)?
 
@@ -590,6 +613,12 @@ final class TiledUIView<
       // With .never, scroll indicators need manual safe area adjustment
       collectionView.verticalScrollIndicatorInsets.top = uiEdgeInsets.top
       collectionView.verticalScrollIndicatorInsets.bottom = uiEdgeInsets.bottom
+      // A top-inset-only change (deltaBottom == 0) still moves the anchor's
+      // chrome, so re-pin the held target.
+      if isInitialAnchorActive {
+        tiledLayout.invalidateLayout()
+        repinInitialAnchorIfActive()
+      }
       return
     }
 
@@ -610,6 +639,13 @@ final class TiledUIView<
       self.collectionView.verticalScrollIndicatorInsets.top = uiEdgeInsets.top
       self.collectionView.verticalScrollIndicatorInsets.bottom = uiEdgeInsets.bottom
       self.tiledLayout.invalidateLayout()
+      // While the anchor window is active, the keyboard/inset delta compensation
+      // above is superseded by an absolute re-pin of the held target (an absolute
+      // offset, so no double-apply of the delta). Runs after the new inset is
+      // applied so the anchored geometry is computed against the new chrome.
+      if self.isInitialAnchorActive {
+        self.repinInitialAnchorIfActive()
+      }
     }
 
     // Pre-calculate final geometry to notify after animation
@@ -665,7 +701,10 @@ final class TiledUIView<
       tiledLayout.sectionItemCountsProvider = { [weak self] in
         self?.displaySectionItemCounts() ?? []
       }
-      
+      tiledLayout.anchoredTargetIndexProvider = { [weak self] in
+        self?.anchoredTargetIndexPath()
+      }
+
       collectionView = .init(frame: .zero, collectionViewLayout: tiledLayout)
       collectionView.translatesAutoresizingMaskIntoConstraints = false
       collectionView.selfSizingInvalidation = .enabledIncludingConstraints
@@ -1177,6 +1216,18 @@ final class TiledUIView<
     super.layoutSubviews()
     updateHiddenEdgeContentInset()
 
+    // Re-pin the anchored target across bounds changes (e.g. rotation). The first
+    // real bounds is the positioning pass itself, so skip re-pinning until a
+    // subsequent change.
+    let boundsSize = collectionView.bounds.size
+    if boundsSize != lastLaidOutBoundsSize {
+      let hadPreviousBounds = lastLaidOutBoundsSize != .zero
+      lastLaidOutBoundsSize = boundsSize
+      if hadPreviousBounds, isInitialAnchorActive {
+        repinInitialAnchorIfActive()
+      }
+    }
+
     // Execute any pending actions synchronously within this layout pass. These
     // include the initial scroll-to-bottom on replace; applying it here — in the
     // same transaction as the reload, rather than deferring a runloop — means the
@@ -1265,7 +1316,10 @@ final class TiledUIView<
           guard let self else { return }
           self.tiledLayout.endBatchUpdates()
 
-          if autoScrollsToBottomOnAppend {
+          // The initial-anchor window supersedes append auto-follow: while the
+          // reader is held at the anchored target, a new tail item must not
+          // scroll the list to the bottom.
+          if autoScrollsToBottomOnAppend && !isInitialAnchorActive {
             scrollTo(edge: .bottom, animated: true)
           }
 
@@ -1605,6 +1659,9 @@ final class TiledUIView<
 
   func scrollViewWillBeginDragging(_ scrollView: UIScrollView) {
     isUserScrollSessionActive = true
+    // The first user drag ends the initial-anchor window; the reader has taken
+    // over the scroll position.
+    releaseInitialAnchor()
   }
 
   func scrollViewDidEndDragging(_ scrollView: UIScrollView, willDecelerate decelerate: Bool) {
@@ -1751,6 +1808,10 @@ final class TiledUIView<
     guard position.version > lastAppliedScrollVersion else { return }
     lastAppliedScrollVersion = position.version
 
+    // Any explicit scroll command supersedes the initial-anchor window: the
+    // host has asked for a new position, so the held target no longer applies.
+    releaseInitialAnchor()
+
     if let itemID = position.itemID {
       scrollToItem(id: itemID, anchor: position.itemAnchor, animated: position.animated)
       return
@@ -1894,7 +1955,12 @@ final class TiledUIView<
     if !hasAppliedInitialPositioning,
        let target = initialScrollTarget,
        let index = items.firstIndex(where: { AnyHashable($0.id) == target.id }) {
-      positionInitialTarget(at: index, anchor: target.anchor)
+      // Arm the anchor window only when the target actually positioned; the
+      // bottom-on-replace fallback and an unresolved id keep the one-shot
+      // behavior.
+      if positionInitialTarget(at: index, anchor: target.anchor), target.holdUntilUserScroll {
+        armInitialAnchor(target)
+      }
       return
     }
 
@@ -1909,18 +1975,30 @@ final class TiledUIView<
   /// `scrollToItem(at:)` because the layout pins content with a negative inset the
   /// native target-offset math mishandles, and because this runs inside a layout
   /// pass where a reentrant native scroll is unsafe.
-  private func positionInitialTarget(at index: Int, anchor: UnitPoint) {
+  @discardableResult
+  private func positionInitialTarget(at index: Int, anchor: UnitPoint) -> Bool {
     // Resolve pending self-sizing heights before reading layout attributes;
     // first-mount metrics can be width-0 estimates until prepare() runs.
     collectionView.layoutIfNeeded()
 
     let indexPath = DisplaySection.messages.indexPath(item: index)
-    guard let attributes = tiledLayout.layoutAttributesForItem(at: indexPath) else {
+    guard let offsetY = anchoredContentOffsetY(forItemAt: indexPath, anchor: anchor) else {
       if scrollsToBottomOnReplace {
         scrollTo(edge: .bottom, animated: false)
       }
-      return
+      return false
     }
+
+    collectionView.contentOffset.y = offsetY
+    return true
+  }
+
+  /// Absolute content offset that lands the item at `indexPath` at `anchor`
+  /// within the viewport, clamped to the scrollable bounds. Nil when the item has
+  /// no layout attributes. Shared by the one-shot positioning and the anchor
+  /// window re-pin so both keep identical geometry.
+  private func anchoredContentOffsetY(forItemAt indexPath: IndexPath, anchor: UnitPoint) -> CGFloat? {
+    guard let attributes = tiledLayout.layoutAttributesForItem(at: indexPath) else { return nil }
 
     // The content inset carries the virtual-space pinning (a large negative
     // top), so it cannot serve as viewport chrome here; additionalContentInset
@@ -1933,7 +2011,38 @@ final class TiledUIView<
       - anchor.y * visibleHeight
 
     let bounds = scrollableContentOffsetBounds()
-    collectionView.contentOffset.y = min(max(anchoredOffsetY, bounds.min), bounds.max)
+    return min(max(anchoredOffsetY, bounds.min), bounds.max)
+  }
+
+  // MARK: - Initial Anchor Window
+
+  private func armInitialAnchor(_ target: TiledInitialScrollTarget) {
+    activeInitialAnchor = target
+  }
+
+  private func releaseInitialAnchor() {
+    activeInitialAnchor = nil
+  }
+
+  /// Current display-order index path and anchor fraction of the held target, or
+  /// nil when the window is inactive or the id no longer resolves. Supplied to the
+  /// layout so self-sizing keeps the target visually fixed.
+  private func anchoredTargetIndexPath() -> (indexPath: IndexPath, anchorY: CGFloat)? {
+    guard let anchor = activeInitialAnchor,
+          let index = items.firstIndex(where: { AnyHashable($0.id) == anchor.id }) else { return nil }
+    return (DisplaySection.messages.indexPath(item: index), anchor.anchor.y)
+  }
+
+  /// Re-pins the held target to its anchored resting offset. Used for chrome
+  /// (keyboard/inset) and bounds (rotation) changes, outside the per-invalidation
+  /// self-sizing path. No-op when the window is inactive or the id is unresolved.
+  private func repinInitialAnchorIfActive() {
+    guard let anchor = activeInitialAnchor?.anchor,
+          let resolved = anchoredTargetIndexPath() else { return }
+
+    collectionView.layoutIfNeeded()
+    guard let offsetY = anchoredContentOffsetY(forItemAt: resolved.indexPath, anchor: anchor) else { return }
+    collectionView.contentOffset.y = offsetY
   }
 
   private func scrollToContentOffsetY(
@@ -2374,6 +2483,54 @@ final class TiledUIView<
     )
   }
 }
+
+#if DEBUG
+// MARK: - Test Support
+
+/// Internal seams for hosted tests that drive a real `TiledUIView` in a window
+/// and inspect its layout geometry. Not part of the public API.
+extension TiledUIView {
+
+  var test_collectionView: UICollectionView { collectionView }
+
+  var test_contentOffsetY: CGFloat { collectionView.contentOffset.y }
+
+  var test_pointsFromBottom: CGFloat { collectionView.tiledScrollGeometry.pointsFromBottom }
+
+  /// Layout frame of the message at `index`, in the shared content-offset space.
+  func test_messageFrame(at index: Int) -> CGRect? {
+    let indexPath = TiledCollectionViewLayout.DisplaySection.messages.indexPath(item: index)
+    return tiledLayout.layoutAttributesForItem(at: indexPath)?.frame
+  }
+
+  /// Drives the real self-sizing path for the message at `index` as UIKit would:
+  /// reports a preferred height increased by `delta`, then applies the resulting
+  /// `contentOffsetAdjustment`. Returns that adjustment.
+  @discardableResult
+  func test_growMessage(at index: Int, by delta: CGFloat) -> CGFloat {
+    let indexPath = TiledCollectionViewLayout.DisplaySection.messages.indexPath(item: index)
+    guard let original = tiledLayout.layoutAttributesForItem(at: indexPath),
+          let preferred = original.copy() as? UICollectionViewLayoutAttributes else { return 0 }
+    preferred.frame.size.height += delta
+    // `invalidationContext(forPreferredLayoutAttributes:)` mutates the item
+    // metrics and returns the offset compensation; apply it as UIKit would. Do
+    // not additionally feed the context back through `invalidateLayout(with:)`,
+    // which would apply the same `contentOffsetAdjustment` a second time.
+    let context = tiledLayout.invalidationContext(
+      forPreferredLayoutAttributes: preferred,
+      withOriginalAttributes: original
+    )
+    let adjustment = context.contentOffsetAdjustment.y
+    collectionView.contentOffset.y += adjustment
+    return adjustment
+  }
+
+  /// Simulates the start of a user drag, releasing the anchor window.
+  func test_beginUserDrag() {
+    scrollViewWillBeginDragging(collectionView)
+  }
+}
+#endif
 
 // MARK: - TiledViewRepresentable
 
@@ -2900,15 +3057,24 @@ extension TiledView {
     return self
   }
 
-  /// Sets a one-shot initial scroll target applied by the first non-empty
-  /// snapshot. A nil id positions at the bottom (the default); a resolved id
-  /// lands that item at `anchor` within the viewport. The target is consumed
-  /// once, after which appends and replaces follow the normal scroll behavior.
+  /// Sets an initial scroll target applied by the first non-empty snapshot. A nil
+  /// id positions at the bottom (the default); a resolved id lands that item at
+  /// `anchor` within the viewport.
+  ///
+  /// When `holdUntilUserScroll` is true (the default), the resolved target arms an
+  /// anchor window: it is re-pinned through late self-sizing (async link previews,
+  /// images) and chrome/bounds changes so it does not drift, and it suppresses
+  /// append auto-follow, until the first user drag or programmatic scroll. Pass
+  /// false to revert to one-shot positioning, where the target is placed once and
+  /// then follows normal scroll behavior.
   public consuming func initialScrollTarget(
     id: AnyHashable?,
-    anchor: UnitPoint = .center
+    anchor: UnitPoint = .center,
+    holdUntilUserScroll: Bool = true
   ) -> Self {
-    self.initialScrollTarget = id.map { TiledInitialScrollTarget(id: $0, anchor: anchor) }
+    self.initialScrollTarget = id.map {
+      TiledInitialScrollTarget(id: $0, anchor: anchor, holdUntilUserScroll: holdUntilUserScroll)
+    }
     return self
   }
 

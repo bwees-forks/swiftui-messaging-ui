@@ -23,6 +23,12 @@ public final class TiledCollectionViewLayout: UICollectionViewLayout {
   /// Use this to add extra space for keyboard, headers, footers, etc.
   public var additionalContentInset: UIEdgeInsets = .zero
 
+  /// While the initial-anchor window is active, returns the anchored target's
+  /// current display-order index path and its anchor's vertical fraction. Set by
+  /// `TiledUIView`; returns `nil` once the window releases or the target id no
+  /// longer resolves, so self-sizing falls back to the settled-list heuristic.
+  var anchoredTargetIndexProvider: (() -> (indexPath: IndexPath, anchorY: CGFloat)?)?
+
   // MARK: - Constants
 
   private let virtualContentHeight: CGFloat = 100_000_000
@@ -269,8 +275,16 @@ public final class TiledCollectionViewLayout: UICollectionViewLayout {
     newHeight: CGFloat
   ) -> CGFloat? {
     guard batchUpdateMetrics == nil,
-          let collectionView,
-          DisplaySection(rawValue: indexPath.section) == .messages,
+          let collectionView else { return nil }
+
+    // While the initial-anchor window is active the anchored target owns the
+    // resting position; keep it visually fixed instead of applying the
+    // settled-list heuristic below.
+    if let anchored = anchoredContentOffsetAdjustment(at: indexPath, newHeight: newHeight) {
+      return anchored
+    }
+
+    guard DisplaySection(rawValue: indexPath.section) == .messages,
           let item = currentItemMetrics().item(at: indexPath) else { return nil }
 
     let heightDiff = newHeight - item.height
@@ -286,6 +300,54 @@ public final class TiledCollectionViewLayout: UICollectionViewLayout {
       viewportTop: viewportTop,
       nearBottom: nearBottom
     )
+  }
+
+  /// Target-aware self-sizing compensation used while the initial-anchor window
+  /// is active. Holds the anchored target visually fixed by matching the offset
+  /// shift to the target's own resulting position shift:
+  /// - Resized item above the target in a top-fixed section (messages): the
+  ///   growth pushes the target down, so shift by the full delta.
+  /// - Resized item above the target in a trailing-preserving section
+  ///   (prependLoader/headerContent): the growth is absorbed upward and the
+  ///   target does not move, so no shift.
+  /// - Resized item is the target: shift by its anchor fraction so the anchor
+  ///   point, not the top edge, stays fixed.
+  /// - Resized item below the target: no shift.
+  ///
+  /// The target id is re-resolved to the current index on every call, so prepends
+  /// and inserts that shift indices are tracked. Returns `nil` when no window is
+  /// active or the id no longer resolves, deferring to the settled-list heuristic.
+  private func anchoredContentOffsetAdjustment(
+    at indexPath: IndexPath,
+    newHeight: CGFloat
+  ) -> CGFloat? {
+    guard let target = anchoredTargetIndexProvider?(),
+          let item = currentItemMetrics().item(at: indexPath) else { return nil }
+
+    let heightDiff = newHeight - item.height
+    guard heightDiff != 0 else { return nil }
+
+    switch displayOrder(indexPath, relativeTo: target.indexPath) {
+    case .orderedAscending:
+      // The target is pushed down only by top-fixed sections; trailing-preserving
+      // sections grow upward and leave it in place.
+      let pushesTargetDown = DisplaySection(rawValue: indexPath.section)
+        .map { !$0.shouldPreserveTrailingPositionsWhenSelfSizing } ?? true
+      return pushesTargetDown ? heightDiff : 0
+    case .orderedSame:
+      return target.anchorY * heightDiff
+    case .orderedDescending:
+      return 0
+    }
+  }
+
+  /// Orders two index paths by display position: section first, then item.
+  private func displayOrder(_ lhs: IndexPath, relativeTo rhs: IndexPath) -> ComparisonResult {
+    if lhs.section != rhs.section {
+      return lhs.section < rhs.section ? .orderedAscending : .orderedDescending
+    }
+    if lhs.item == rhs.item { return .orderedSame }
+    return lhs.item < rhs.item ? .orderedAscending : .orderedDescending
   }
 
   /// Pure decision for how far to shift `contentOffset` when a message bubble
