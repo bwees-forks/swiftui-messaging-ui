@@ -475,6 +475,11 @@ final class TiledUIView<
   /// Nil positions at the bottom via `scrollsToBottomOnReplace`.
   var initialScrollTarget: TiledInitialScrollTarget?
 
+  /// Per-edge scroll effect styles. Nil leaves the system default on that edge.
+  var edgeEffectStyles = TiledEdgeEffectStyles() {
+    didSet { applyEdgeEffectStyles() }
+  }
+
   /// True once the first non-empty snapshot has positioned the content. Gates the
   /// one-shot target jump and withholds scroll-geometry reports until the resting
   /// position is set, so stale pre-position offsets are not published.
@@ -574,6 +579,22 @@ final class TiledUIView<
 
     guard hasAppliedItemSnapshot else { return }
     updateHeaderContentVisibility()
+  }
+
+  private func applyEdgeEffectStyles() {
+    guard #available(iOS 26.0, *), collectionView != nil else { return }
+    if let style = edgeEffectStyles.top {
+      collectionView.topEdgeEffect.style = style.uiKitStyle
+    }
+    if let style = edgeEffectStyles.bottom {
+      collectionView.bottomEdgeEffect.style = style.uiKitStyle
+    }
+    if let style = edgeEffectStyles.left {
+      collectionView.leftEdgeEffect.style = style.uiKitStyle
+    }
+    if let style = edgeEffectStyles.right {
+      collectionView.rightEdgeEffect.style = style.uiKitStyle
+    }
   }
 
   /// Additional content inset for keyboard, headers, footers, etc.
@@ -717,6 +738,7 @@ final class TiledUIView<
       collectionView.contentInsetAdjustmentBehavior = .never
       collectionView.automaticallyAdjustsScrollIndicatorInsets = false
       collectionView.isPrefetchingEnabled = false
+      applyEdgeEffectStyles()
       
       registerCell(TiledViewCell<Cell>.self, kind: .item)
       registerCell(TiledViewCell<PrependLoadingView>.self, kind: .prependLoader)
@@ -2562,6 +2584,7 @@ struct TiledViewRepresentable<
   let typingIndicator: TypingIndicator<TypingIndicatorContent>?
   let headerContent: HeaderContent<HeaderContentView>?
   let initialScrollTarget: TiledInitialScrollTarget?
+  let edgeEffectStyles: TiledEdgeEffectStyles
   @Binding var scrollPosition: TiledScrollPosition
 
   init(
@@ -2579,6 +2602,7 @@ struct TiledViewRepresentable<
     typingIndicator: TypingIndicator<TypingIndicatorContent>?,
     headerContent: HeaderContent<HeaderContentView>?,
     initialScrollTarget: TiledInitialScrollTarget? = nil,
+    edgeEffectStyles: TiledEdgeEffectStyles = TiledEdgeEffectStyles(),
     cellBuilder: @escaping (Item, CellReveal?, CellStateStorage<StateValue>) -> Cell
   ) {
     self.items = items
@@ -2595,6 +2619,7 @@ struct TiledViewRepresentable<
     self.typingIndicator = typingIndicator
     self.headerContent = headerContent
     self.initialScrollTarget = initialScrollTarget
+    self.edgeEffectStyles = edgeEffectStyles
     self.cellBuilder = cellBuilder
   }
 
@@ -2629,6 +2654,7 @@ struct TiledViewRepresentable<
     uiView.onTapBackground = onTapBackground
     uiView.onDragIntoBottomSafeArea = onDragIntoBottomSafeArea
     uiView.revealConfiguration = revealConfiguration
+    uiView.edgeEffectStyles = edgeEffectStyles
 
     // Update loaders, typing indicator, and header content
     uiView.setLoaders(prepend: prependLoader, append: appendLoader)
@@ -2644,6 +2670,48 @@ struct TiledViewRepresentable<
 }
 
 // MARK: - TiledView
+
+/// Stored so TiledView can compile against iOS 17 while the public modifier
+/// takes SwiftUI's iOS 26 `ScrollEdgeEffectStyle`.
+enum TiledStoredEdgeEffectStyle: Equatable, Sendable {
+  case automatic
+  case soft
+  case hard
+
+  @available(iOS 26.0, *)
+  init(_ style: ScrollEdgeEffectStyle) {
+    if style == .soft {
+      self = .soft
+    } else if style == .hard {
+      self = .hard
+    } else {
+      self = .automatic
+    }
+  }
+
+  @available(iOS 26.0, *)
+  var uiKitStyle: UIScrollEdgeEffect.Style {
+    switch self {
+    case .automatic: .automatic
+    case .soft: .soft
+    case .hard: .hard
+    }
+  }
+}
+
+struct TiledEdgeEffectStyles: Equatable, Sendable {
+  var top: TiledStoredEdgeEffectStyle?
+  var bottom: TiledStoredEdgeEffectStyle?
+  var left: TiledStoredEdgeEffectStyle?
+  var right: TiledStoredEdgeEffectStyle?
+
+  mutating func set(_ style: TiledStoredEdgeEffectStyle, for edges: Edge.Set) {
+    if edges.contains(.top) { top = style }
+    if edges.contains(.bottom) { bottom = style }
+    if edges.contains(.leading) { left = style }
+    if edges.contains(.trailing) { right = style }
+  }
+}
 
 /// A high-performance SwiftUI list view built on UICollectionView,
 /// designed for chat/messaging applications with bidirectional infinite scrolling.
@@ -2816,6 +2884,7 @@ public struct TiledView<
   let typingIndicator: TypingIndicator<TypingIndicatorContent>?
   let headerContent: HeaderContent<HeaderContentView>?
   var initialScrollTarget: TiledInitialScrollTarget?
+  var edgeEffectStyles = TiledEdgeEffectStyles()
   @Binding var scrollPosition: TiledScrollPosition
 
   /// Internal initializer for creating TiledView with all parameters (used by modifiers)
@@ -2833,6 +2902,7 @@ public struct TiledView<
     typingIndicator: TypingIndicator<TypingIndicatorContent>?,
     headerContent: HeaderContent<HeaderContentView>?,
     initialScrollTarget: TiledInitialScrollTarget? = nil,
+    edgeEffectStyles: TiledEdgeEffectStyles = TiledEdgeEffectStyles(),
     scrollPosition: Binding<TiledScrollPosition>
   ) {
     self.items = items
@@ -2848,6 +2918,7 @@ public struct TiledView<
     self.typingIndicator = typingIndicator
     self.headerContent = headerContent
     self.initialScrollTarget = initialScrollTarget
+    self.edgeEffectStyles = edgeEffectStyles
     self._scrollPosition = scrollPosition
   }
 }
@@ -2943,6 +3014,7 @@ extension TiledView where PrependLoadingView == Never {
       typingIndicator: typingIndicator,
       headerContent: headerContent,
       initialScrollTarget: initialScrollTarget,
+      edgeEffectStyles: edgeEffectStyles,
       scrollPosition: $scrollPosition
     )
   }
@@ -2968,6 +3040,7 @@ extension TiledView where AppendLoadingView == Never {
       typingIndicator: typingIndicator,
       headerContent: headerContent,
       initialScrollTarget: initialScrollTarget,
+      edgeEffectStyles: edgeEffectStyles,
       scrollPosition: $scrollPosition
     )
   }
@@ -2993,6 +3066,7 @@ extension TiledView where TypingIndicatorContent == Never {
       typingIndicator: indicator,
       headerContent: headerContent,
       initialScrollTarget: initialScrollTarget,
+      edgeEffectStyles: edgeEffectStyles,
       scrollPosition: $scrollPosition
     )
   }
@@ -3018,6 +3092,7 @@ extension TiledView where HeaderContentView == Never {
       typingIndicator: typingIndicator,
       headerContent: header,
       initialScrollTarget: initialScrollTarget,
+      edgeEffectStyles: edgeEffectStyles,
       scrollPosition: $scrollPosition
     )
   }
@@ -3044,6 +3119,7 @@ extension TiledView {
         typingIndicator: typingIndicator,
         headerContent: headerContent,
         initialScrollTarget: initialScrollTarget,
+        edgeEffectStyles: edgeEffectStyles,
         cellBuilder: cellBuilder
       )
       .ignoresSafeArea()
@@ -3143,6 +3219,24 @@ extension TiledView {
     _ configuration: RevealConfiguration
   ) -> Self {
     self.revealConfiguration = configuration
+    return self
+  }
+
+  /// Sets the UIKit scroll edge effect on the tiled collection view.
+  ///
+  /// SwiftUI's `scrollEdgeEffectStyle(_:for:)` does not reach a representable-hosted
+  /// `UICollectionView`, so this writes `UIScrollView` edge effects directly.
+  ///
+  /// ```swift
+  /// TiledView(...)
+  ///   .scrollEdgeEffectStyle(.soft, for: .top)
+  /// ```
+  @available(iOS 26.0, *)
+  public consuming func scrollEdgeEffectStyle(
+    _ style: ScrollEdgeEffectStyle,
+    for edges: Edge.Set = .all
+  ) -> Self {
+    edgeEffectStyles.set(TiledStoredEdgeEffectStyle(style), for: edges)
     return self
   }
 }
