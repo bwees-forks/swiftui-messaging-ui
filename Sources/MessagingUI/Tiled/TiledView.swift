@@ -589,10 +589,12 @@ final class TiledUIView<
     if let style = edgeEffectStyles.bottom {
       collectionView.bottomEdgeEffect.style = style.uiKitStyle
     }
-    if let style = edgeEffectStyles.left {
+    // Edge.Set is layout-relative; leftEdgeEffect/rightEdgeEffect are physical.
+    let isRTL = effectiveUserInterfaceLayoutDirection == .rightToLeft
+    if let style = isRTL ? edgeEffectStyles.trailing : edgeEffectStyles.leading {
       collectionView.leftEdgeEffect.style = style.uiKitStyle
     }
-    if let style = edgeEffectStyles.right {
+    if let style = isRTL ? edgeEffectStyles.leading : edgeEffectStyles.trailing {
       collectionView.rightEdgeEffect.style = style.uiKitStyle
     }
   }
@@ -2702,14 +2704,14 @@ enum TiledStoredEdgeEffectStyle: Equatable, Sendable {
 struct TiledEdgeEffectStyles: Equatable, Sendable {
   var top: TiledStoredEdgeEffectStyle?
   var bottom: TiledStoredEdgeEffectStyle?
-  var left: TiledStoredEdgeEffectStyle?
-  var right: TiledStoredEdgeEffectStyle?
+  var leading: TiledStoredEdgeEffectStyle?
+  var trailing: TiledStoredEdgeEffectStyle?
 
   mutating func set(_ style: TiledStoredEdgeEffectStyle, for edges: Edge.Set) {
     if edges.contains(.top) { top = style }
     if edges.contains(.bottom) { bottom = style }
-    if edges.contains(.leading) { left = style }
-    if edges.contains(.trailing) { right = style }
+    if edges.contains(.leading) { leading = style }
+    if edges.contains(.trailing) { trailing = style }
   }
 }
 
