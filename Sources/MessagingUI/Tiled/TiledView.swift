@@ -361,6 +361,8 @@ final class TiledUIView<
 
   private let tiledLayout: TiledCollectionViewLayout = .init()
   private var collectionView: UICollectionView!
+  private weak var ownedNavigationBar: UINavigationBar?
+  private var ownedNavigationBarInteraction: (any UIInteraction)?
 
   private var items: Deque<Item> = []
   private var displayedAccessoryState = DisplayedAccessoryState()
@@ -597,6 +599,40 @@ final class TiledUIView<
     if let style = isRTL ? edgeEffectStyles.leading : edgeEffectStyles.trailing {
       collectionView.rightEdgeEffect.style = style.uiKitStyle
     }
+    updateTopEdgeEffectBinding()
+  }
+
+  /// Attach the top-edge interaction to the pushed page's navigation bar.
+  /// iOS 27 sizes the pocket from that bar's descendants; skip inner hosts.
+  @available(iOS 26.0, *)
+  private func updateTopEdgeEffectBinding() {
+    guard edgeEffectStyles.top != nil, window != nil, collectionView != nil else {
+      unbindTopEdgeEffect()
+      return
+    }
+    let navBar = sequence(first: self as UIResponder, next: \.next)
+      .compactMap { $0 as? UIViewController }
+      .first { $0.parent is UINavigationController }?
+      .navigationController?
+      .navigationBar
+    guard ownedNavigationBar !== navBar else { return }
+    unbindTopEdgeEffect()
+    guard let navBar else { return }
+    let interaction = UIScrollEdgeElementContainerInteraction()
+    interaction.edge = .top
+    interaction.scrollView = collectionView
+    navBar.addInteraction(interaction)
+    ownedNavigationBarInteraction = interaction
+    ownedNavigationBar = navBar
+  }
+
+  @available(iOS 26.0, *)
+  private func unbindTopEdgeEffect() {
+    if let navBar = ownedNavigationBar, let interaction = ownedNavigationBarInteraction {
+      navBar.removeInteraction(interaction)
+    }
+    ownedNavigationBarInteraction = nil
+    ownedNavigationBar = nil
   }
 
   /// Additional content inset for keyboard, headers, footers, etc.
@@ -804,6 +840,13 @@ final class TiledUIView<
   override func safeAreaInsetsDidChange() {
     super.safeAreaInsetsDidChange()
     applyContentInsets()
+  }
+
+  override func didMoveToWindow() {
+    super.didMoveToWindow()
+    if #available(iOS 26.0, *) {
+      updateTopEdgeEffectBinding()
+    }
   }
 
   @objc private func handleTapBackground(_ gesture: UITapGestureRecognizer) {
@@ -1239,6 +1282,11 @@ final class TiledUIView<
   override func layoutSubviews() {
     super.layoutSubviews()
     updateHiddenEdgeContentInset()
+    if #available(iOS 26.0, *),
+       edgeEffectStyles.top != nil,
+       ownedNavigationBar == nil {
+      updateTopEdgeEffectBinding()
+    }
 
     // Re-pin the anchored target across bounds changes (e.g. rotation). The first
     // real bounds is the positioning pass itself, so skip re-pinning until a
