@@ -742,7 +742,10 @@ final class TiledUIView<
 
   /// Per-item cell state storage
   private var storageMap: [Item.ID: CellStateStorage<StateValue>] = [:]
-  
+
+  /// Message heights kept across view instances, supplied by the owner.
+  var sizeCache: TiledSizeCache<Item>?
+
   private var pendingActionsOnLayoutSubviews: [() -> Void] = []
 
   init(
@@ -756,6 +759,10 @@ final class TiledUIView<
     do {
       tiledLayout.itemSizeProviderForIndexPath = { [weak self] indexPath, width in
         self?.measureSize(at: indexPath, width: width)
+      }
+      tiledLayout.onSelfSizedMessageHeight = { [weak self] index, height, width in
+        guard let self, index >= 0, index < items.count else { return }
+        sizeCache?.store(height, for: items[index], width: width)
       }
       tiledLayout.sectionItemCountsProvider = { [weak self] in
         self?.displaySectionItemCounts() ?? []
@@ -872,8 +879,13 @@ final class TiledUIView<
     case .messages:
       guard indexPath.item >= 0, indexPath.item < items.count else { return .zero }
       let item = items[indexPath.item]
+      if let height = sizeCache?.height(for: item, width: width) {
+        return CGSize(width: width, height: height)
+      }
       let storage = getOrCreateStorage(for: item)
-      return measureHostedCellSize(cellBuilder(item, cellReveal, storage), width: width, using: itemSizingCell)
+      let size = measureHostedCellSize(cellBuilder(item, cellReveal, storage), width: width, using: itemSizingCell)
+      sizeCache?.store(size.height, for: item, width: width)
+      return size
 
     case .prependLoader, .headerContent, .typingIndicator, .appendLoader:
       guard let displayItem = accessoryDisplayItem(at: indexPath) else { return nil }
@@ -2635,6 +2647,7 @@ struct TiledViewRepresentable<
   let headerContent: HeaderContent<HeaderContentView>?
   let initialScrollTarget: TiledInitialScrollTarget?
   let edgeEffectStyles: TiledEdgeEffectStyles
+  let sizeCache: TiledSizeCache<Item>?
   @Binding var scrollPosition: TiledScrollPosition
 
   init(
@@ -2653,6 +2666,7 @@ struct TiledViewRepresentable<
     headerContent: HeaderContent<HeaderContentView>?,
     initialScrollTarget: TiledInitialScrollTarget? = nil,
     edgeEffectStyles: TiledEdgeEffectStyles = TiledEdgeEffectStyles(),
+    sizeCache: TiledSizeCache<Item>? = nil,
     cellBuilder: @escaping (Item, CellReveal?, CellStateStorage<StateValue>) -> Cell
   ) {
     self.items = items
@@ -2670,6 +2684,7 @@ struct TiledViewRepresentable<
     self.headerContent = headerContent
     self.initialScrollTarget = initialScrollTarget
     self.edgeEffectStyles = edgeEffectStyles
+    self.sizeCache = sizeCache
     self.cellBuilder = cellBuilder
   }
 
@@ -2705,6 +2720,7 @@ struct TiledViewRepresentable<
     uiView.onDragIntoBottomSafeArea = onDragIntoBottomSafeArea
     uiView.revealConfiguration = revealConfiguration
     uiView.edgeEffectStyles = edgeEffectStyles
+    uiView.sizeCache = sizeCache
 
     // Update loaders, typing indicator, and header content
     uiView.setLoaders(prepend: prependLoader, append: appendLoader)
@@ -2935,6 +2951,7 @@ public struct TiledView<
   let headerContent: HeaderContent<HeaderContentView>?
   var initialScrollTarget: TiledInitialScrollTarget?
   var edgeEffectStyles = TiledEdgeEffectStyles()
+  var sizeCache: TiledSizeCache<Item>?
   @Binding var scrollPosition: TiledScrollPosition
 
   /// Internal initializer for creating TiledView with all parameters (used by modifiers)
@@ -2953,6 +2970,7 @@ public struct TiledView<
     headerContent: HeaderContent<HeaderContentView>?,
     initialScrollTarget: TiledInitialScrollTarget? = nil,
     edgeEffectStyles: TiledEdgeEffectStyles = TiledEdgeEffectStyles(),
+    sizeCache: TiledSizeCache<Item>? = nil,
     scrollPosition: Binding<TiledScrollPosition>
   ) {
     self.items = items
@@ -2969,6 +2987,7 @@ public struct TiledView<
     self.headerContent = headerContent
     self.initialScrollTarget = initialScrollTarget
     self.edgeEffectStyles = edgeEffectStyles
+    self.sizeCache = sizeCache
     self._scrollPosition = scrollPosition
   }
 }
@@ -3065,6 +3084,7 @@ extension TiledView where PrependLoadingView == Never {
       headerContent: headerContent,
       initialScrollTarget: initialScrollTarget,
       edgeEffectStyles: edgeEffectStyles,
+      sizeCache: sizeCache,
       scrollPosition: $scrollPosition
     )
   }
@@ -3091,6 +3111,7 @@ extension TiledView where AppendLoadingView == Never {
       headerContent: headerContent,
       initialScrollTarget: initialScrollTarget,
       edgeEffectStyles: edgeEffectStyles,
+      sizeCache: sizeCache,
       scrollPosition: $scrollPosition
     )
   }
@@ -3117,6 +3138,7 @@ extension TiledView where TypingIndicatorContent == Never {
       headerContent: headerContent,
       initialScrollTarget: initialScrollTarget,
       edgeEffectStyles: edgeEffectStyles,
+      sizeCache: sizeCache,
       scrollPosition: $scrollPosition
     )
   }
@@ -3143,6 +3165,7 @@ extension TiledView where HeaderContentView == Never {
       headerContent: header,
       initialScrollTarget: initialScrollTarget,
       edgeEffectStyles: edgeEffectStyles,
+      sizeCache: sizeCache,
       scrollPosition: $scrollPosition
     )
   }
@@ -3170,6 +3193,7 @@ extension TiledView {
         headerContent: headerContent,
         initialScrollTarget: initialScrollTarget,
         edgeEffectStyles: edgeEffectStyles,
+        sizeCache: sizeCache,
         cellBuilder: cellBuilder
       )
       .ignoresSafeArea()
@@ -3269,6 +3293,19 @@ extension TiledView {
     _ configuration: RevealConfiguration
   ) -> Self {
     self.revealConfiguration = configuration
+    return self
+  }
+
+  /// Supplies a cache of measured message heights that outlives this view.
+  ///
+  /// Pass the same cache to views that show the same items, such as a
+  /// conversation that is closed and reopened, so reopening skips measuring
+  /// unchanged items. Set the cache's `context` to anything outside the
+  /// items that affects height.
+  public consuming func sizeCache(
+    _ cache: TiledSizeCache<Item>?
+  ) -> Self {
+    self.sizeCache = cache
     return self
   }
 

@@ -15,6 +15,9 @@ public final class TiledCollectionViewLayout: UICollectionViewLayout {
 
   /// Closure to query item size using the section-aware collection view identity.
   var itemSizeProviderForIndexPath: ((_ indexPath: IndexPath, _ width: CGFloat) -> CGSize?)?
+  /// Reports a message cell's self-sized height outside batch updates, where
+  /// the index matches the current items.
+  var onSelfSizedMessageHeight: ((_ index: Int, _ height: CGFloat, _ width: CGFloat) -> Void)?
 
   /// Closure to query item counts for each visual section in layout order.
   var sectionItemCountsProvider: (() -> [Int])?
@@ -243,6 +246,9 @@ public final class TiledCollectionViewLayout: UICollectionViewLayout {
         context.contentOffsetAdjustment.y = adjustment
       }
       updateItemHeightForSelfSizing(at: indexPath, newHeight: newHeight)
+      if batchUpdateMetrics == nil, indexPath.section == DisplaySection.messages.rawValue {
+        onSelfSizedMessageHeight?(indexPath.item, newHeight, preferredAttributes.frame.width)
+      }
     }
 
     return context
