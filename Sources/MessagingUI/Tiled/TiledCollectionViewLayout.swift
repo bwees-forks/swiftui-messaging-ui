@@ -634,8 +634,12 @@ public final class TiledCollectionViewLayout: UICollectionViewLayout {
     }
   }
 
+  /// Returns nil without measuring at zero width. Callers fall back to
+  /// `estimatedHeight` and set `needsHeightRecalculation`, so `prepare()`
+  /// measures the items once the real width is known.
   private func itemSize(at indexPath: IndexPath, width: CGFloat) -> CGSize? {
-    itemSizeProviderForIndexPath?(indexPath, width)
+    guard width > 0 else { return nil }
+    return itemSizeProviderForIndexPath?(indexPath, width)
   }
 
   private struct ItemMetric {
