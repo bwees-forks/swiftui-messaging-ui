@@ -126,16 +126,26 @@ public final class TiledCollectionViewLayout: UICollectionViewLayout {
 
     let boundsWidth = collectionView.bounds.width
 
-    // Recalculate heights if they were added when width was 0
-    if needsHeightRecalculation && boundsWidth > 0 {
-      recalculateAllHeights(width: boundsWidth)
-      needsHeightRecalculation = false
-    }
-
     // Invalidate cache if width changed
     if lastPreparedBoundsWidth != boundsWidth {
       attributesCache.removeAll(keepingCapacity: true)
       lastPreparedBoundsWidth = boundsWidth
+    }
+
+    prepareMetrics()
+  }
+
+  /// Brings item metrics and the content inset up to date without laying out
+  /// cells, so the content offset can be set before cells materialize.
+  func prepareMetrics() {
+    guard let collectionView else { return }
+
+    let boundsWidth = collectionView.bounds.width
+
+    // Recalculate heights if they were added when width was 0
+    if needsHeightRecalculation && boundsWidth > 0 {
+      recalculateAllHeights(width: boundsWidth)
+      needsHeightRecalculation = false
     }
 
     // Automatically update contentInset
