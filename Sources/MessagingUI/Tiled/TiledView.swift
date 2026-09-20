@@ -487,6 +487,12 @@ final class TiledUIView<
   /// position is set, so stale pre-position offsets are not published.
   private var hasAppliedInitialPositioning: Bool = false
 
+#if DEBUG
+  /// Index paths passed to `cellForItemAt`, in order. Recorded only once a
+  /// test sets this to a non-nil array.
+  var test_configuredIndexPaths: [IndexPath]?
+#endif
+
   /// Active initial-anchor window. When set, the stored target is re-pinned
   /// through late self-sizing and chrome/bounds changes instead of drifting. The
   /// id is re-resolved to the current index on each use so prepends and inserts
@@ -1317,8 +1323,8 @@ final class TiledUIView<
     // same transaction as the reload, rather than deferring a runloop — means the
     // first paint is already at the bottom instead of briefly showing the
     // pre-scroll (top) position for one frame. Deferral to layoutSubviews (over
-    // an inline scroll in `.replace`) is retained so bounds and content size are
-    // valid before scrolling.
+    // an inline scroll in `.replace`) is retained so bounds are valid before
+    // scrolling. Content size comes from the layout's own metrics.
     guard !pendingActionsOnLayoutSubviews.isEmpty else { return }
     let actions = pendingActionsOnLayoutSubviews
     pendingActionsOnLayoutSubviews.removeAll()
@@ -1509,6 +1515,9 @@ final class TiledUIView<
   }
 
   func collectionView(_ collectionView: UICollectionView, cellForItemAt indexPath: IndexPath) -> UICollectionViewCell {
+#if DEBUG
+    test_configuredIndexPaths?.append(indexPath)
+#endif
     guard let section = DisplaySection(rawValue: indexPath.section) else {
       return dequeueEmptyCell(collectionView, at: indexPath)
     }
@@ -1767,7 +1776,7 @@ final class TiledUIView<
     guard hasAppliedInitialPositioning else { return }
     let geometry = TiledScrollGeometry(
       contentOffset: collectionView.contentOffset,
-      contentSize: collectionView.contentSize,
+      contentSize: tiledLayout.collectionViewContentSize,
       visibleSize: collectionView.bounds.size,
       contentInset: collectionView.adjustedContentInset
     )
@@ -2014,18 +2023,19 @@ final class TiledUIView<
   private func scrollableContentOffsetBounds() -> (min: CGFloat, max: CGFloat) {
     let inset = collectionView.adjustedContentInset
     let minOffsetY = -inset.top
+    // Read the layout's size, which is valid before the collection view lays out.
     let maxOffsetY = max(
       minOffsetY,
-      collectionView.contentSize.height - collectionView.bounds.height + inset.bottom
+      tiledLayout.collectionViewContentSize.height - collectionView.bounds.height + inset.bottom
     )
     return (minOffsetY, maxOffsetY)
   }
 
   /// Positions the content for the first non-empty snapshot: to the initial
   /// scroll target when one resolves, otherwise the bottom pin. Runs inside a
-  /// layout pass so bounds and content size are valid. An empty snapshot defers
-  /// positioning so the one-shot target and geometry suppression survive to the
-  /// first non-empty snapshot.
+  /// layout pass so bounds are valid. An empty snapshot defers positioning so
+  /// the one-shot target and geometry suppression survive to the first
+  /// non-empty snapshot.
   private func applyInitialPositioning() {
     guard !items.isEmpty else { return }
     // Emit one report from the resting position so observers can derive their
@@ -2049,8 +2059,20 @@ final class TiledUIView<
     }
 
     if scrollsToBottomOnReplace {
-      scrollTo(edge: .bottom, animated: false)
+      pinInitialPositionToBottom()
     }
+  }
+
+  /// Sets the bottom offset from the layout metrics alone, so cells lay out
+  /// once at the resting offset instead of first at the pre-scroll offset.
+  private func pinInitialPositionToBottom() {
+    isUserScrollSessionActive = false
+    springAnimator?.stop(finished: false)
+    springAnimator = nil
+    collectionView.setContentOffset(collectionView.contentOffset, animated: false)
+    tiledLayout.prepareMetrics()
+    collectionView.contentOffset.y = scrollableContentOffsetBounds().max
+    collectionView.flashScrollIndicators()
   }
 
   /// Sets `contentOffset` so the item at `index` rests at `anchor` within the
@@ -2061,14 +2083,13 @@ final class TiledUIView<
   /// pass where a reentrant native scroll is unsafe.
   @discardableResult
   private func positionInitialTarget(at index: Int, anchor: UnitPoint) -> Bool {
-    // Resolve pending self-sizing heights before reading layout attributes;
-    // first-mount metrics can be width-0 estimates until prepare() runs.
-    collectionView.layoutIfNeeded()
+    // First-mount metrics can be width-0 estimates until they are prepared.
+    tiledLayout.prepareMetrics()
 
     let indexPath = DisplaySection.messages.indexPath(item: index)
     guard let offsetY = anchoredContentOffsetY(forItemAt: indexPath, anchor: anchor) else {
       if scrollsToBottomOnReplace {
-        scrollTo(edge: .bottom, animated: false)
+        pinInitialPositionToBottom()
       }
       return false
     }
