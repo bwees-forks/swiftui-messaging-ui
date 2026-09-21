@@ -3194,10 +3194,36 @@ extension TiledView where HeaderContentView == Never {
 
 // MARK: - View Body and Basic Modifiers
 
+/// Forward an inset only for an ignored edge. The reader is already inside
+/// the safe area, so a side inset must not widen the cells.
+struct TiledSafeAreaPolicy: Equatable {
+  var ignoredEdges: Edge.Set
+  var contentInsets: EdgeInsets
+
+  static func make(insets: EdgeInsets, expandsUnderTopChrome: Bool) -> TiledSafeAreaPolicy {
+    TiledSafeAreaPolicy(
+      ignoredEdges: expandsUnderTopChrome ? .vertical : .bottom,
+      contentInsets: EdgeInsets(
+        top: expandsUnderTopChrome ? insets.top : 0,
+        leading: 0,
+        bottom: insets.bottom,
+        trailing: 0
+      )
+    )
+  }
+}
+
 extension TiledView {
 
   public var body: some View {
     GeometryReader { proxy in
+      // iOS 26 draws under the top bar. Earlier systems keep that edge so
+      // the timeline does not run through the navigation header.
+      let expandsUnderTopChrome = if #available(iOS 26, *) { true } else { false }
+      let policy = TiledSafeAreaPolicy.make(
+        insets: proxy.safeAreaInsets,
+        expandsUnderTopChrome: expandsUnderTopChrome
+      )
       TiledViewRepresentable(
         items: items,
         scrollPosition: $scrollPosition,
@@ -3206,7 +3232,7 @@ extension TiledView {
         onTapBackground: onTapBackground,
         onDragIntoBottomSafeArea: onDragIntoBottomSafeArea,
         additionalContentInset: additionalContentInset,
-        swiftUIWorldSafeAreaInset: proxy.safeAreaInsets,
+        swiftUIWorldSafeAreaInset: policy.contentInsets,
         revealConfiguration: revealConfiguration,
         prependLoader: prependLoader,
         appendLoader: appendLoader,
@@ -3217,10 +3243,12 @@ extension TiledView {
         sizeCache: sizeCache,
         cellBuilder: cellBuilder
       )
-      .ignoresSafeArea()
+      .ignoresSafeArea(edges: policy.ignoredEdges)
     }
   }
+}
 
+extension TiledView {
   public consuming func onTiledScrollGeometryChange(
     _ action: @escaping (TiledScrollGeometry) -> Void
   ) -> Self {
