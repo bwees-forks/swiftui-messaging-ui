@@ -111,6 +111,7 @@ public final class TiledCollectionViewLayout: UICollectionViewLayout {
   // MARK: - UICollectionViewLayout Overrides
 
   public override var collectionViewContentSize: CGSize {
+    // Narrower cells must not make the list scroll sideways.
     CGSize(
       width: collectionView?.bounds.width ?? 0,
       height: virtualContentHeight
@@ -140,11 +141,11 @@ public final class TiledCollectionViewLayout: UICollectionViewLayout {
   func prepareMetrics() {
     guard let collectionView else { return }
 
-    let boundsWidth = collectionView.bounds.width
+    let columnWidth = columnRect().width
 
-    // Recalculate heights if they were added when width was 0
-    if needsHeightRecalculation && boundsWidth > 0 {
-      recalculateAllHeights(width: boundsWidth)
+    // Heights added at width 0 wait for the column, not the raw bounds.
+    if needsHeightRecalculation && columnWidth > 0 {
+      recalculateAllHeights(width: columnWidth)
       needsHeightRecalculation = false
     }
 
@@ -155,15 +156,15 @@ public final class TiledCollectionViewLayout: UICollectionViewLayout {
   public override func layoutAttributesForElements(in rect: CGRect) -> [UICollectionViewLayoutAttributes]? {
     var result: [UICollectionViewLayoutAttributes] = []
 
-    let boundsWidth = collectionView?.bounds.width ?? 0
+    let column = columnRect()
 
     let metrics = activeItemMetrics()
     for item in metrics.items(intersecting: rect) {
       let height = item.metric.height
       let frame = CGRect(
-        x: 0,
+        x: column.minX,
         y: item.metric.yPosition,
-        width: boundsWidth,
+        width: column.width,
         height: height
       )
 
@@ -181,11 +182,11 @@ public final class TiledCollectionViewLayout: UICollectionViewLayout {
 
     guard let item = metrics.item(at: indexPath) else { return nil }
 
-    let boundsWidth = collectionView?.bounds.width ?? 0
+    let column = columnRect()
     let frame = CGRect(
-      x: 0,
+      x: column.minX,
       y: item.yPosition,
-      width: boundsWidth,
+      width: column.width,
       height: item.height
     )
 
@@ -408,7 +409,7 @@ public final class TiledCollectionViewLayout: UICollectionViewLayout {
   // MARK: - Item Management
 
   func resetItemMetrics(expectedItemCount: Int) {
-    let width = collectionView?.bounds.width ?? 0
+    let width = columnRect().width
 
     if width == 0 {
       needsHeightRecalculation = true
@@ -440,7 +441,7 @@ public final class TiledCollectionViewLayout: UICollectionViewLayout {
   ) {
     guard count > 0 else { return }
 
-    let width = collectionView?.bounds.width ?? 0
+    let width = columnRect().width
 
     if width == 0 {
       needsHeightRecalculation = true
@@ -486,7 +487,7 @@ public final class TiledCollectionViewLayout: UICollectionViewLayout {
   ) {
     guard count > 0 else { return }
 
-    let width = collectionView?.bounds.width ?? 0
+    let width = columnRect().width
 
     if width == 0 {
       needsHeightRecalculation = true
@@ -614,6 +615,22 @@ public final class TiledCollectionViewLayout: UICollectionViewLayout {
   }
 
   // MARK: - Private Helpers
+
+  /// Horizontal cell column in collection-view coordinates. Read while
+  /// building attributes. A zero horizontal inset is the full bounds width.
+  /// `layoutFrame.origin.y` is not the bounds-relative top inset (a settled
+  /// window has reported a y near 50_000_000, the same magnitude as this
+  /// layout's content anchor). Vertical placement stays on the item metric.
+  private func columnRect() -> CGRect {
+    guard let collectionView else { return .zero }
+    let guide = collectionView.safeAreaLayoutGuide.layoutFrame
+    return CGRect(
+      x: guide.minX,
+      y: 0,
+      width: guide.width,
+      height: collectionView.bounds.height
+    )
+  }
 
   /// Recalculates all item heights and Y positions when width becomes available.
   private func recalculateAllHeights(width: CGFloat) {

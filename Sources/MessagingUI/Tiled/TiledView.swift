@@ -853,6 +853,9 @@ final class TiledUIView<
   override func safeAreaInsetsDidChange() {
     super.safeAreaInsetsDidChange()
     applyContentInsets()
+    // A bounds-stable inset skips shouldInvalidateLayout(forBoundsChange:).
+    // This does not move contentOffset; the next pass reads the guide.
+    tiledLayout.invalidateLayout()
   }
 
   override func didMoveToWindow() {
@@ -1127,7 +1130,8 @@ final class TiledUIView<
   }
 
   private func measuredAccessoryHeight(for displayItem: AccessoryDisplayItem) -> CGFloat {
-    measureSize(for: displayItem, width: collectionView.bounds.width)?.height ?? 0
+    let columnWidth = collectionView.safeAreaLayoutGuide.layoutFrame.width
+    return measureSize(for: displayItem, width: columnWidth)?.height ?? 0
   }
 
   private func updateHiddenEdgeContentInset(animated: Bool = false) {
