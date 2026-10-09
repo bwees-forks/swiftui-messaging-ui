@@ -360,7 +360,7 @@ final class TiledUIView<
 >: UIView, UICollectionViewDataSource, UICollectionViewDelegate, UIGestureRecognizerDelegate {
 
   private let tiledLayout: TiledCollectionViewLayout = .init()
-  private var collectionView: UICollectionView!
+  private var collectionView: TiledCollectionView!
   private weak var ownedNavigationBar: UINavigationBar?
   private var ownedNavigationBarInteraction: (any UIInteraction)?
 
@@ -453,6 +453,8 @@ final class TiledUIView<
   /// Whether the current scroll movement was initiated by the user's pan gesture.
   private var isUserScrollSessionActive: Bool = false
 
+  private let insetBottomPinThreshold: CGFloat = 100
+
   /// Whether a status-bar scroll-to-top request is waiting for prepend loading to settle.
   private var isPrependLoadRequestedByScrollToTop: Bool = false
 
@@ -491,6 +493,8 @@ final class TiledUIView<
   /// Index paths passed to `cellForItemAt`, in order. Recorded only once a
   /// test sets this to a non-nil array.
   var test_configuredIndexPaths: [IndexPath]?
+
+  var test_scrollInteraction: (isTracking: Bool, isDragging: Bool, isDecelerating: Bool)?
 #endif
 
   /// Active initial-anchor window. When set, the stored target is re-pinned
@@ -505,6 +509,15 @@ final class TiledUIView<
 
   /// Bounds size at the last layout pass, used to re-pin the anchor on rotation.
   private var lastLaidOutBoundsSize: CGSize = .zero
+
+  private struct ViewportGeometry {
+    let geometry: TiledScrollGeometry
+    var isUserControlled: Bool
+    let scrollVersion: UInt
+  }
+
+  private var pendingViewportGeometry: ViewportGeometry?
+  private var isRestoringViewport = false
 
   /// Scroll geometry change callback
   var onTiledScrollGeometryChange: ((TiledScrollGeometry) -> Void)?
@@ -659,79 +672,27 @@ final class TiledUIView<
   }
 
   private func applyContentInsets() {
-    // Capture old state to preserve scroll position
-    let oldBottomInset = collectionView.adjustedContentInset.bottom
-    let oldOffsetY = collectionView.contentOffset.y
-
     let combined = additionalContentInset + swiftUIWorldSafeAreaInset
-    // With .never, adjustedContentInset = contentInset (no automatic safeArea addition)
-    // So we directly use our desired insets without subtracting safeAreaInsets
     let uiEdgeInsets = combined.toUIEdgeInsets(layoutDirection: effectiveUserInterfaceLayoutDirection)
-    // Calculate delta before applying changes
-    // Delta = new additionalContentInset.bottom - old additionalContentInset.bottom
-    let oldAdditionalBottom = tiledLayout.additionalContentInset.bottom
-    let deltaBottom = uiEdgeInsets.bottom - oldAdditionalBottom
-
-    guard deltaBottom != 0 else {
-      // Just apply without animation if no change
-      tiledLayout.additionalContentInset = uiEdgeInsets
-      // With .never, scroll indicators need manual safe area adjustment
-      collectionView.verticalScrollIndicatorInsets.top = uiEdgeInsets.top
-      collectionView.verticalScrollIndicatorInsets.bottom = uiEdgeInsets.bottom
-      // A top-inset-only change (deltaBottom == 0) still moves the anchor's
-      // chrome, so re-pin the held target.
-      if isInitialAnchorActive {
-        tiledLayout.invalidateLayout()
-        repinInitialAnchorIfActive()
-      }
-      return
-    }
-
-    // Calculate target offset
-    var offsetY = oldOffsetY + deltaBottom
-
-    // Pre-calculate overscroll bounds (using new inset values)
-    // Note: We estimate the new adjustedContentInset based on the delta
-    let estimatedNewAdjustedBottom = oldBottomInset + deltaBottom
-    let minOffsetY = -collectionView.adjustedContentInset.top
-    let maxOffsetY = collectionView.contentSize.height - collectionView.bounds.height + estimatedNewAdjustedBottom
-    offsetY = max(minOffsetY, min(maxOffsetY, offsetY))
-    
+    guard uiEdgeInsets != tiledLayout.additionalContentInset else { return }
     let applyChanges = {
-      self.collectionView.contentOffset.y = offsetY
+      self.captureViewportGeometry()
       self.tiledLayout.additionalContentInset = uiEdgeInsets
-      // With .never, scroll indicators need manual safe area adjustment
       self.collectionView.verticalScrollIndicatorInsets.top = uiEdgeInsets.top
       self.collectionView.verticalScrollIndicatorInsets.bottom = uiEdgeInsets.bottom
       self.tiledLayout.invalidateLayout()
-      // While the anchor window is active, the keyboard/inset delta compensation
-      // above is superseded by an absolute re-pin of the held target (an absolute
-      // offset, so no double-apply of the delta). Runs after the new inset is
-      // applied so the anchored geometry is computed against the new chrome.
-      if self.isInitialAnchorActive {
-        self.repinInitialAnchorIfActive()
-      }
+      self.tiledLayout.prepareMetrics()
+
+      // The parent positions the first snapshot before cells materialize.
+      guard self.hasAppliedInitialPositioning else { return }
+
+      self.collectionView.layoutIfNeeded()
+      self.restoreViewportGeometryIfNeeded()
     }
 
-    // Pre-calculate final geometry to notify after animation
-    let finalGeometry = TiledScrollGeometry(
-      contentOffset: CGPoint(x: collectionView.contentOffset.x, y: offsetY),
-      contentSize: collectionView.contentSize,
-      visibleSize: collectionView.bounds.size,
-      contentInset: UIEdgeInsets(
-        top: collectionView.adjustedContentInset.top,
-        left: collectionView.adjustedContentInset.left,
-        bottom: estimatedNewAdjustedBottom,
-        right: collectionView.adjustedContentInset.right
-      )
-    )
-
     if #available(iOS 18, *) {
-      // context.animate {} in UIViewRepresentable handles animation asynchronously
       applyChanges()
-      if hasAppliedInitialPositioning {
-        onTiledScrollGeometryChange?(finalGeometry)
-      }
+      notifyScrollGeometry()
     } else {
       UIView.animate(
         withDuration: 0.5,
@@ -740,10 +701,20 @@ final class TiledUIView<
       ) {
         applyChanges()
       } completion: { _ in
-        guard self.hasAppliedInitialPositioning else { return }
-        self.onTiledScrollGeometryChange?(finalGeometry)
+        self.notifyScrollGeometry()
       }
     }
+  }
+
+  private var isUserControllingContentOffset: Bool {
+#if DEBUG
+    if let interaction = test_scrollInteraction {
+      return interaction.isTracking || interaction.isDragging || interaction.isDecelerating
+        || isUserScrollSessionActive
+    }
+#endif
+    return collectionView.isTracking || collectionView.isDragging || collectionView.isDecelerating
+      || isUserScrollSessionActive
   }
 
   /// Per-item cell state storage
@@ -778,6 +749,9 @@ final class TiledUIView<
       }
 
       collectionView = .init(frame: .zero, collectionViewLayout: tiledLayout)
+      collectionView.onBoundsSizeWillChange = { [weak self] in
+        self?.captureViewportGeometry()
+      }
       collectionView.translatesAutoresizingMaskIntoConstraints = false
       collectionView.selfSizingInvalidation = .enabledIncludingConstraints
       collectionView.backgroundColor = .clear
@@ -790,7 +764,7 @@ final class TiledUIView<
       collectionView.automaticallyAdjustsScrollIndicatorInsets = false
       collectionView.isPrefetchingEnabled = false
       applyEdgeEffectStyles()
-      
+
       registerCell(TiledViewCell<Cell>.self, kind: .item)
       registerCell(TiledViewCell<PrependLoadingView>.self, kind: .prependLoader)
       registerCell(TiledViewCell<HeaderContentView>.self, kind: .headerContent)
@@ -804,13 +778,13 @@ final class TiledUIView<
         collectionView.addGestureRecognizer(tapGesture)
       }
 
-      /// setup 
+      /// setup
       do {
         let bottomSafeAreaPanGesture = UIPanGestureRecognizer(
           target: self,
           action: #selector(handleBottomSafeAreaPanGesture(_:))
         )
-        
+
         bottomSafeAreaPanGesture.cancelsTouchesInView = false
         bottomSafeAreaPanGesture.delegate = self
         collectionView.addGestureRecognizer(bottomSafeAreaPanGesture)
@@ -849,7 +823,7 @@ final class TiledUIView<
       forCellWithReuseIdentifier: TiledViewCell<Content>.reuseIdentifier(for: kind.rawValue)
     )
   }
-  
+
   override func safeAreaInsetsDidChange() {
     super.safeAreaInsetsDidChange()
     applyContentInsets()
@@ -1310,31 +1284,66 @@ final class TiledUIView<
       updateTopEdgeEffectBinding()
     }
 
-    // Re-pin the anchored target across bounds changes (e.g. rotation). The first
-    // real bounds is the positioning pass itself, so skip re-pinning until a
-    // subsequent change.
     let boundsSize = collectionView.bounds.size
-    if boundsSize != lastLaidOutBoundsSize {
-      let hadPreviousBounds = lastLaidOutBoundsSize != .zero
-      lastLaidOutBoundsSize = boundsSize
-      if hadPreviousBounds, isInitialAnchorActive {
-        repinInitialAnchorIfActive()
-      }
+    let boundsChanged = boundsSize != lastLaidOutBoundsSize
+    let hadPreviousBounds = lastLaidOutBoundsSize != .zero
+    lastLaidOutBoundsSize = boundsSize
+    let hadPendingViewport = pendingViewportGeometry != nil
+
+    if hadPendingViewport {
+      restoreViewportGeometryIfNeeded()
+    } else if boundsChanged, hadPreviousBounds, isInitialAnchorActive {
+      repinInitialAnchorIfActive()
     }
 
-    // Execute any pending actions synchronously within this layout pass. These
-    // include the initial scroll-to-bottom on replace; applying it here — in the
-    // same transaction as the reload, rather than deferring a runloop — means the
-    // first paint is already at the bottom instead of briefly showing the
-    // pre-scroll (top) position for one frame. Deferral to layoutSubviews (over
-    // an inline scroll in `.replace`) is retained so bounds are valid before
-    // scrolling. Content size comes from the layout's own metrics.
-    guard !pendingActionsOnLayoutSubviews.isEmpty else { return }
+    // Execute initial positioning in the same layout pass, once bounds are valid.
     let actions = pendingActionsOnLayoutSubviews
     pendingActionsOnLayoutSubviews.removeAll()
     for action in actions {
       action()
     }
+    if boundsChanged || hadPendingViewport {
+      notifyScrollGeometry()
+    }
+  }
+
+  private func captureViewportGeometry() {
+    guard pendingViewportGeometry == nil,
+          hasAppliedInitialPositioning,
+          let collectionView,
+          collectionView.bounds.width > 0,
+          collectionView.bounds.height > 0 else { return }
+    pendingViewportGeometry = ViewportGeometry(
+      geometry: collectionView.tiledScrollGeometry,
+      isUserControlled: isUserControllingContentOffset,
+      scrollVersion: lastAppliedScrollVersion
+    )
+  }
+
+  private func restoreViewportGeometryIfNeeded() {
+    guard let previous = pendingViewportGeometry, !isRestoringViewport else { return }
+    isRestoringViewport = true
+    defer {
+      pendingViewportGeometry = nil
+      isRestoringViewport = false
+    }
+    tiledLayout.prepareMetrics()
+    guard !previous.isUserControlled, !isUserControllingContentOffset,
+          previous.scrollVersion == lastAppliedScrollVersion else { return }
+    if isInitialAnchorActive {
+      repinInitialAnchorIfActive()
+      return
+    }
+    let bounds = scrollableContentOffsetBounds()
+    let distance = previous.geometry.pointsFromBottom
+    let desiredOffset = distance < insetBottomPinThreshold
+      ? bounds.max - distance
+      : previous.geometry.contentOffset.y + previous.geometry.visibleSize.height - collectionView.bounds.height
+    let offsetY = min(max(desiredOffset, bounds.min), bounds.max)
+    if collectionView.contentOffset.y != offsetY {
+      collectionView.contentOffset.y = offsetY
+    }
+    collectionView.layoutIfNeeded()
   }
 
   private func applyChange(
@@ -1756,6 +1765,7 @@ final class TiledUIView<
 
   func scrollViewWillBeginDragging(_ scrollView: UIScrollView) {
     isUserScrollSessionActive = true
+    pendingViewportGeometry?.isUserControlled = true
     // The first user drag ends the initial-anchor window; the reader has taken
     // over the scroll position.
     releaseInitialAnchor()
@@ -1774,6 +1784,7 @@ final class TiledUIView<
   }
 
   private func notifyScrollGeometry() {
+    guard pendingViewportGeometry == nil else { return }
     guard let onTiledScrollGeometryChange else { return }
     // Withhold reports until the first positioning pass sets the resting offset;
     // pre-position offsets read as an oversized distance from the bottom.
@@ -2146,7 +2157,8 @@ final class TiledUIView<
   /// (keyboard/inset) and bounds (rotation) changes, outside the per-invalidation
   /// self-sizing path. No-op when the window is inactive or the id is unresolved.
   private func repinInitialAnchorIfActive() {
-    guard let anchor = activeInitialAnchor?.anchor,
+    guard !isUserControllingContentOffset,
+          let anchor = activeInitialAnchor?.anchor,
           let resolved = anchoredTargetIndexPath() else { return }
 
     collectionView.layoutIfNeeded()
@@ -2720,7 +2732,6 @@ struct TiledViewRepresentable<
   }
 
   func updateUIView(_ uiView: UIViewType, context: Context) {
-
     if #available(iOS 18.0, *) {
       context.animate {
         uiView.additionalContentInset = additionalContentInset

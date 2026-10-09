@@ -99,6 +99,7 @@ public final class TiledCollectionViewLayout: UICollectionViewLayout {
   }
 
   private var pendingUpdate: PendingUpdate?
+  private var isAnimatingBoundsSizeChange = false
 
   /// Edge content that should keep its cell height but not expand the scrollable content bounds.
   var hiddenEdgeContentInset: UIEdgeInsets = .zero {
@@ -120,6 +121,36 @@ public final class TiledCollectionViewLayout: UICollectionViewLayout {
 
   public override func shouldInvalidateLayout(forBoundsChange newBounds: CGRect) -> Bool {
     collectionView?.bounds.size != newBounds.size
+  }
+
+  public override func prepare(forAnimatedBoundsChange oldBounds: CGRect) {
+    super.prepare(forAnimatedBoundsChange: oldBounds)
+    isAnimatingBoundsSizeChange = oldBounds.size != collectionView?.bounds.size
+  }
+
+  // A bounds resize exposes existing rows without inserting or removing messages.
+  // Keep their attributes fixed while the collection's viewport animates.
+  public override func initialLayoutAttributesForAppearingItem(
+    at itemIndexPath: IndexPath
+  ) -> UICollectionViewLayoutAttributes? {
+    if isAnimatingBoundsSizeChange, batchUpdateMetrics == nil {
+      return layoutAttributesForItem(at: itemIndexPath)?.copy() as? UICollectionViewLayoutAttributes
+    }
+    return super.initialLayoutAttributesForAppearingItem(at: itemIndexPath)
+  }
+
+  public override func finalLayoutAttributesForDisappearingItem(
+    at itemIndexPath: IndexPath
+  ) -> UICollectionViewLayoutAttributes? {
+    if isAnimatingBoundsSizeChange, batchUpdateMetrics == nil {
+      return layoutAttributesForItem(at: itemIndexPath)?.copy() as? UICollectionViewLayoutAttributes
+    }
+    return super.finalLayoutAttributesForDisappearingItem(at: itemIndexPath)
+  }
+
+  public override func finalizeAnimatedBoundsChange() {
+    super.finalizeAnimatedBoundsChange()
+    isAnimatingBoundsSizeChange = false
   }
 
   public override func prepare() {

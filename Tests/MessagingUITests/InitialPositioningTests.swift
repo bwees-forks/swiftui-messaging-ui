@@ -24,6 +24,7 @@ final class InitialPositioningTests: XCTestCase {
 
   private let viewport = CGSize(width: 320, height: 600)
   private let cellHeight: CGFloat = 100
+  private let inputChromeHeight: CGFloat = 180
   private let tolerance: CGFloat = 1.0
 
   /// Allow four cells above the resting viewport, covering prefetching and the
@@ -36,16 +37,19 @@ final class InitialPositioningTests: XCTestCase {
 
   private var windows: [UIWindow] = []
 
-  override func tearDown() {
-    for window in windows { window.isHidden = true }
-    windows.removeAll()
-    super.tearDown()
+  override func tearDown() async throws {
+    await MainActor.run {
+      for window in windows { window.isHidden = true }
+      windows.removeAll()
+    }
+    try await super.tearDown()
   }
 
   private func mount(
     count: Int,
     target: TiledInitialScrollTarget? = nil,
-    startsAtZeroWidth: Bool = false
+    startsAtZeroWidth: Bool = false,
+    insetBeforeInitialPositioning: CGFloat? = nil
   ) -> HostView {
     let height = cellHeight
     let view = HostView(
@@ -75,6 +79,12 @@ final class InitialPositioningTests: XCTestCase {
       window.addSubview(view)
       view.test_configuredIndexPaths = []
       view.applyItems(items)
+    }
+    if let insetBeforeInitialPositioning {
+      XCTAssertTrue(configuredMessages(view).isEmpty, "positioning must still be pending")
+      view.swiftUIWorldSafeAreaInset = EdgeInsets(
+        top: 0, leading: 0, bottom: insetBeforeInitialPositioning, trailing: 0
+      )
     }
     pump(view)
     return view
@@ -166,6 +176,31 @@ final class InitialPositioningTests: XCTestCase {
     let mid = view.test_contentOffsetY + viewport.height / 2
     XCTAssertEqual(frame.midY, mid, accuracy: tolerance, "target rests at the center")
 
+    assertLaidOutOnce(view, topItem: targetItem - visibleCells / 2)
+  }
+
+  func test_bottomPin_insetBeforeInitialPositioning_laysOutRestingCellsOnce() {
+    let count = 40
+    let view = mount(count: count, insetBeforeInitialPositioning: inputChromeHeight)
+
+    XCTAssertEqual(view.test_pointsFromBottom, 0, accuracy: tolerance)
+    assertLaidOutOnce(view, topItem: count - visibleCells)
+  }
+
+  func test_initialTarget_insetBeforeInitialPositioning_laysOutRestingCellsOnce() {
+    let targetItem = 25
+    let target = TiledInitialScrollTarget(
+      id: AnyHashable(targetItem), anchor: .center, holdUntilUserScroll: true
+    )
+    let view = mount(
+      count: 40,
+      target: target,
+      insetBeforeInitialPositioning: inputChromeHeight
+    )
+
+    let frame = view.test_messageFrame(at: targetItem)!
+    let visibleMidY = view.test_contentOffsetY + (viewport.height - inputChromeHeight) / 2
+    XCTAssertEqual(frame.midY, visibleMidY, accuracy: tolerance)
     assertLaidOutOnce(view, topItem: targetItem - visibleCells / 2)
   }
 }
