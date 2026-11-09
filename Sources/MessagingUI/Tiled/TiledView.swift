@@ -331,6 +331,13 @@ extension Optional where Wrapped == HeaderContent<Never> {
 
 // MARK: - TiledUIView
 
+/// Loaded rows whose content exposes one heading, plus the callback that runs
+/// before the rotor moves to one of them.
+struct TiledAccessibilityHeadingConfiguration {
+  let itemIDs: Set<AnyHashable>
+  let onNavigate: () -> Void
+}
+
 /// A one-shot target for the initial scroll position of the first non-empty
 /// snapshot. A nil target positions at the bottom; a resolved target lands the
 /// item at `anchor` within the viewport.
@@ -441,9 +448,63 @@ final class TiledUIView<
 
   /// Scroll position tracking
   private var lastAppliedScrollVersion: UInt = 0
+  private var pendingItemScrollPosition: TiledScrollPosition?
 
   /// Spring animator for programmatic scroll animations.
   private var springAnimator: SpringScrollAnimator?
+
+  private struct EdgeScrollCommand {
+    let version: UInt
+    let edge: TiledScrollPosition.Edge
+    let focusBottomItem: Bool
+    let notify: (Item.ID?, Bool) -> Void
+  }
+
+  private struct PendingAccessibilityFocus {
+    let generation: UInt
+    let itemID: Item.ID
+    let deadline: Date
+  }
+
+  /// A hosted cell can expose its accessibility element after layout, so focus retries until this deadline.
+  private let accessibilityFocusTimeout: TimeInterval = 1
+
+  private var pendingEdgeCommand: EdgeScrollCommand?
+  private var pendingAccessibilityFocus: PendingAccessibilityFocus?
+  private var edgeCallbackGeneration: UInt = 0
+
+  private func finishEdgeScroll(finished: Bool) {
+    guard let command = pendingEdgeCommand else { return }
+    pendingEdgeCommand = nil
+    if !finished { pendingAccessibilityFocus = nil }
+    let generation = edgeCallbackGeneration
+    DispatchQueue.main.async { [weak self] in
+      guard let self, self.edgeCallbackGeneration == generation else { return }
+      self.deliver(command, finished: finished)
+    }
+  }
+
+  private func deliver(_ command: EdgeScrollCommand, finished: Bool) {
+    collectionView.layoutIfNeeded()
+    let itemID = finished ? itemID(at: command.edge) : nil
+    command.notify(itemID, finished)
+    guard finished, command.focusBottomItem, command.edge == .bottom, let itemID,
+          command.version == lastAppliedScrollVersion else { return }
+    pendingAccessibilityFocus = PendingAccessibilityFocus(
+      generation: edgeCallbackGeneration,
+      itemID: itemID,
+      deadline: Date(timeIntervalSinceNow: accessibilityFocusTimeout)
+    )
+    focusPendingAccessibilityElement()
+  }
+
+  func stopScrollAnimation() {
+    pendingAccessibilityFocus = nil
+    let animator = springAnimator
+    springAnimator = nil
+    finishEdgeScroll(finished: false)
+    animator?.stop(finished: false)
+  }
 
   /// Spring animator for edge content inset changes caused by hiding loaders.
   private var hiddenEdgeContentInsetAnimator: SpringAnimator?
@@ -495,6 +556,10 @@ final class TiledUIView<
   var test_configuredIndexPaths: [IndexPath]?
 
   var test_scrollInteraction: (isTracking: Bool, isDragging: Bool, isDecelerating: Bool)?
+
+  /// Accessibility posts from a finished focus command. Recorded only after a
+  /// test sets this to a non-nil array.
+  var test_accessibilityPosts: [(UIAccessibility.Notification, Any?)]?
 #endif
 
   /// Active initial-anchor window. When set, the stored target is re-pinned
@@ -520,6 +585,8 @@ final class TiledUIView<
   private var isRestoringViewport = false
 
   /// Scroll geometry change callback
+  var onTiledEdgeScrollCompletion: ((TiledEdgeScrollCompletion<Item.ID>) -> Void)?
+  var messageAccessibilityIdentifier: ((Item.ID) -> String)?
   var onTiledScrollGeometryChange: ((TiledScrollGeometry) -> Void)?
 
   /// Background tap callback (for dismissing keyboard, etc.)
@@ -1231,7 +1298,13 @@ final class TiledUIView<
       applyChange(.replace(newItems)) { [weak self] in
         guard let self else { return }
         self.isApplyingItemChanges = false
-        self.finishPendingLoadingIndicatorHides()
+        if let queuedItems = self.queuedItems {
+          self.queuedItems = nil
+          self.applyItems(queuedItems)
+        } else {
+          self.finishPendingLoadingIndicatorHides()
+          self.applyPendingItemScrollPosition()
+        }
       }
       return
     }
@@ -1259,6 +1332,7 @@ final class TiledUIView<
       } else {
         isApplyingItemChanges = false
         finishPendingLoadingIndicatorHides()
+        applyPendingItemScrollPosition()
       }
       return
     }
@@ -1764,6 +1838,8 @@ final class TiledUIView<
   }
 
   func scrollViewWillBeginDragging(_ scrollView: UIScrollView) {
+    pendingItemScrollPosition = nil
+    pendingAccessibilityFocus = nil
     isUserScrollSessionActive = true
     pendingViewportGeometry?.isUserControlled = true
     // The first user drag ends the initial-anchor window; the reader has taken
@@ -1910,24 +1986,219 @@ final class TiledUIView<
     }
   }
 
+  var accessibilityHeadingConfiguration: TiledAccessibilityHeadingConfiguration? {
+    didSet { updateHeadingRotor() }
+  }
+  private var headingRotor: UIAccessibilityCustomRotor?
+
+  private func updateHeadingRotor() {
+    if accessibilityHeadingConfiguration?.itemIDs.isEmpty != false {
+      if let headingRotor {
+        collectionView.accessibilityCustomRotors?.removeAll { $0 === headingRotor }
+      }
+      headingRotor = nil
+    } else if headingRotor == nil {
+      let rotor = UIAccessibilityCustomRotor(systemType: .heading) { [weak self] predicate in
+        self?.headingResult(for: predicate)
+      }
+      headingRotor = rotor
+      collectionView.accessibilityCustomRotors = (collectionView.accessibilityCustomRotors ?? []) + [rotor]
+    }
+  }
+
+  private func accessibilityElement(in root: NSObject, where matches: (NSObject) -> Bool) -> NSObject? {
+    var visited = Set<ObjectIdentifier>()
+    func visit(_ object: NSObject) -> NSObject? {
+      guard visited.insert(ObjectIdentifier(object)).inserted, !object.accessibilityElementsHidden else { return nil }
+      if let view = object as? UIView, view.window == nil || view.isHidden || view.alpha == 0 { return nil }
+      if object.isAccessibilityElement {
+        return matches(object) ? object : nil
+      }
+      var children = (object.accessibilityElements ?? []) + (object.automationElements ?? [])
+      let count = object.accessibilityElementCount()
+      if count != NSNotFound, count > 0 {
+        children += (0..<count).compactMap { object.accessibilityElement(at: $0) }
+      }
+      if let view = object as? UIView { children += view.subviews }
+      for case let child as NSObject in children {
+        if let found = visit(child) { return found }
+      }
+      return nil
+    }
+    return visit(root)
+  }
+
+  private func headingElement(in root: NSObject) -> NSObject? {
+    accessibilityElement(in: root) { $0.accessibilityTraits.contains(.header) }
+  }
+
+  private static func accessibilityIdentifier(of object: NSObject) -> String? {
+    // Hosted elements answer the getter without declaring UIAccessibilityIdentification.
+    let getter = #selector(getter: UIAccessibilityIdentification.accessibilityIdentifier)
+    guard object.responds(to: getter) else { return nil }
+    return object.perform(getter)?.takeUnretainedValue() as? String
+  }
+
+  private func itemID(at edge: TiledScrollPosition.Edge) -> Item.ID? {
+    guard !items.isEmpty else { return nil }
+    let viewport = collectionView.bounds.inset(by: collectionView.adjustedContentInset)
+    guard viewport.height > 1 else {
+      return edge == .bottom ? items.last?.id : items.first?.id
+    }
+    let probeY = edge == .bottom ? viewport.maxY - 1 : viewport.minY + 1
+    let point = CGPoint(x: viewport.midX, y: probeY)
+    if let path = collectionView.indexPathForItem(at: point),
+       path.section == DisplaySection.messages.rawValue,
+       items.indices.contains(path.item) {
+      return items[path.item].id
+    }
+    return edge == .bottom ? items.last?.id : items.first?.id
+  }
+
+  private func focusPendingAccessibilityElement() {
+    guard let pending = pendingAccessibilityFocus, pending.generation == edgeCallbackGeneration else {
+      pendingAccessibilityFocus = nil
+      return
+    }
+    collectionView.layoutIfNeeded()
+    if let element = messageAccessibilityElement(id: pending.itemID), isAccessibilityElementOnScreen(element) {
+      pendingAccessibilityFocus = nil
+      UIAccessibility.post(notification: .layoutChanged, argument: element)
+#if DEBUG
+      test_accessibilityPosts?.append((.layoutChanged, element))
+#endif
+      return
+    }
+    guard Date() < pending.deadline else {
+      pendingAccessibilityFocus = nil
+      return
+    }
+    DispatchQueue.main.async { [weak self] in
+      self?.focusPendingAccessibilityElement()
+    }
+  }
+
+  private func messageAccessibilityElement(id: Item.ID) -> NSObject? {
+    guard let identifier = messageAccessibilityIdentifier?(id),
+          let index = items.firstIndex(where: { $0.id == id }) else { return nil }
+    let indexPath = DisplaySection.messages.indexPath(item: index)
+    guard let cell = collectionView.cellForItem(at: indexPath) else { return nil }
+    return accessibilityElement(in: cell.contentView) { element in
+      Self.accessibilityIdentifier(of: element) == identifier && element.accessibilityLabel?.isEmpty == false
+    }
+  }
+
+  private func isAccessibilityElementOnScreen(_ element: NSObject) -> Bool {
+    guard let window else { return false }
+    let frame = window.convert(element.accessibilityFrame, from: window.screen.coordinateSpace)
+    guard frame.width > 0, frame.height > 0 else { return false }
+    let viewport = collectionView.convert(
+      collectionView.bounds.inset(by: collectionView.adjustedContentInset),
+      to: window
+    )
+    let overlap = viewport.intersection(frame)
+    return !overlap.isNull && overlap.width > 0 && overlap.height > 0
+  }
+
+  private func headingResult(for predicate: UIAccessibilityCustomRotorSearchPredicate) -> UIAccessibilityCustomRotorItemResult? {
+    guard let configuration = accessibilityHeadingConfiguration, !isApplyingItemChanges else { return nil }
+    let candidates = items.indices.filter { configuration.itemIDs.contains(AnyHashable(items[$0].id)) }
+    // VoiceOver can hand the collection as the current item, so search uses the focused element.
+    let supplied = predicate.currentItem.targetElement as? NSObject
+    let current = supplied?.isAccessibilityElement == true && supplied !== collectionView && supplied !== self
+      ? supplied : UIAccessibility.focusedElement(using: .notificationVoiceOver) as? NSObject
+    var currentIndex: Int?
+    if let current, let window {
+      let frame = window.convert(current.accessibilityFrame, from: window.screen.coordinateSpace)
+      let point = collectionView.convert(CGPoint(x: frame.midX, y: frame.midY), from: window)
+      let path = collectionView.indexPathForItem(at: point)
+      if path?.section == DisplaySection.messages.rawValue { currentIndex = path?.item }
+    }
+    let forward = predicate.searchDirection == .next
+    let target: Int?
+    if let currentIndex {
+      var sameRow = false
+      if current?.accessibilityTraits.contains(.header) != true,
+         let cell = collectionView.cellForItem(at: DisplaySection.messages.indexPath(item: currentIndex)),
+         let heading = headingElement(in: cell.contentView), let current {
+        let headingIsAfter = heading.accessibilityFrame.midY > current.accessibilityFrame.midY
+        sameRow = forward ? headingIsAfter : !headingIsAfter
+      }
+      target = forward
+        ? candidates.first { $0 > currentIndex || ($0 == currentIndex && sameRow) }
+        : candidates.last { $0 < currentIndex || ($0 == currentIndex && sameRow) }
+    } else {
+      target = forward ? candidates.first : candidates.last
+    }
+    guard let target else { return nil }
+    configuration.onNavigate()
+    pendingItemScrollPosition = nil
+    pendingViewportGeometry?.isUserControlled = true
+    releaseInitialAnchor()
+    isUserScrollSessionActive = false
+    stopScrollAnimation()
+    guard positionInitialTarget(at: target, anchor: .top) else { return nil }
+    collectionView.layoutIfNeeded()
+    guard let cell = collectionView.cellForItem(at: DisplaySection.messages.indexPath(item: target)),
+          let heading = headingElement(in: cell.contentView),
+          !heading.accessibilityFrame.isEmpty else { return nil }
+    return UIAccessibilityCustomRotorItemResult(targetElement: heading, targetRange: nil)
+  }
+
   // MARK: - Scroll Position
 
   func applyScrollPosition(_ position: TiledScrollPosition) {
     guard position.version > lastAppliedScrollVersion else { return }
     lastAppliedScrollVersion = position.version
+    pendingItemScrollPosition = nil
+    stopScrollAnimation()
 
     // Any explicit scroll command supersedes the initial-anchor window: the
     // host has asked for a new position, so the held target no longer applies.
     releaseInitialAnchor()
 
     if let itemID = position.itemID {
+      if isApplyingItemChanges {
+        pendingItemScrollPosition = position
+        return
+      }
       scrollToItem(id: itemID, anchor: position.itemAnchor, animated: position.animated)
       return
     }
 
-    guard let edge = position.edge else { return }
+    guard let edge = position.edge else {
+      collectionView.setContentOffset(collectionView.contentOffset, animated: false)
+      return
+    }
 
-    scrollTo(edge: edge, animated: position.animated)
+    scrollTo(
+      edge: edge,
+      animated: position.animated,
+      version: position.version,
+      focusBottomItem: position.focusesBottomAccessibilityElement
+    )
+  }
+
+  private func applyPendingItemScrollPosition() {
+    guard !isApplyingItemChanges, let position = pendingItemScrollPosition else { return }
+    pendingItemScrollPosition = nil
+    guard position.version == lastAppliedScrollVersion, let id = position.itemID else { return }
+    scrollToItem(id: id, anchor: position.itemAnchor, animated: position.animated)
+  }
+
+  func dismantle() {
+    let command = pendingEdgeCommand
+    pendingEdgeCommand = nil
+    pendingAccessibilityFocus = nil
+    edgeCallbackGeneration &+= 1
+    let animator = springAnimator
+    springAnimator = nil
+    animator?.stop(finished: false)
+    command?.notify(nil, false)
+    accessibilityHeadingConfiguration = nil
+    pendingItemScrollPosition = nil
+    onTiledEdgeScrollCompletion = nil
+    messageAccessibilityIdentifier = nil
   }
 
   /// Scrolls so the item matching `id` is positioned at `anchor` within the viewport.
@@ -1942,7 +2213,7 @@ final class TiledUIView<
     guard let index = items.firstIndex(where: { AnyHashable($0.id) == id }) else { return }
 
     isUserScrollSessionActive = false
-    springAnimator?.stop(finished: false)
+    stopScrollAnimation()
     collectionView.setContentOffset(collectionView.contentOffset, animated: false)
 
     // When the whole conversation fits on screen the item is already visible, and
@@ -1964,14 +2235,33 @@ final class TiledUIView<
     collectionView.scrollToItem(at: indexPath, at: position, animated: animated)
   }
 
-  private func scrollTo(edge: TiledScrollPosition.Edge, animated: Bool) {
+  /// Append-follow and the typing indicator omit `version`. They move the list
+  /// and cancel a pending command, but they are not an explicit edge scroll.
+  private func scrollTo(
+    edge: TiledScrollPosition.Edge,
+    animated: Bool,
+    version: UInt? = nil,
+    focusBottomItem: Bool = false
+  ) {
     isUserScrollSessionActive = false
 
     collectionView.layoutIfNeeded()
 
-    // Cancel any existing animation
-    springAnimator?.stop(finished: false)
-    springAnimator = nil
+    // Cancel any existing animation before installing this command.
+    stopScrollAnimation()
+
+    if let version {
+      let notify = onTiledEdgeScrollCompletion.map { callback in
+        return { (itemID: Item.ID?, finished: Bool) in
+          callback(TiledEdgeScrollCompletion(
+            version: version, edge: edge, itemID: itemID, finished: finished
+          ))
+        }
+      } ?? { _, _ in }
+      pendingEdgeCommand = EdgeScrollCommand(
+        version: version, edge: edge, focusBottomItem: focusBottomItem, notify: notify
+      )
+    }
 
     // Stop any existing deceleration
     collectionView.setContentOffset(collectionView.contentOffset, animated: false)
@@ -1981,7 +2271,7 @@ final class TiledUIView<
       springAnimator = animator
 
       // Use dynamic target provider to adapt to contentInset changes mid-animation
-      animator.animate(scrollView: collectionView) { scrollView in
+      animator.animate(scrollView: collectionView, targetProvider: { scrollView in
         let inset = scrollView.adjustedContentInset
         let contentTop = -inset.top
         let contentBottom = max(
@@ -2000,7 +2290,9 @@ final class TiledUIView<
         // Stop when distance to target is minimal (already at destination)
         let shouldStop = abs(target - scrollView.contentOffset.y) < 0.5
         return SpringScrollAnimator.TargetResult(target: target, shouldStop: shouldStop)
-      }
+      }, completion: { [weak self] finished in
+        self?.finishEdgeScroll(finished: finished)
+      })
     } else {
       // Non-animated case: calculate target once and set immediately
       let inset = collectionView.adjustedContentInset
@@ -2018,6 +2310,7 @@ final class TiledUIView<
       }
     }
 
+    if !animated { finishEdgeScroll(finished: true) }
     collectionView.flashScrollIndicators()
   }
 
@@ -2082,8 +2375,7 @@ final class TiledUIView<
   /// once at the resting offset instead of first at the pre-scroll offset.
   private func pinInitialPositionToBottom() {
     isUserScrollSessionActive = false
-    springAnimator?.stop(finished: false)
-    springAnimator = nil
+    stopScrollAnimation()
     collectionView.setContentOffset(collectionView.contentOffset, animated: false)
     tiledLayout.prepareMetrics()
     collectionView.contentOffset.y = scrollableContentOffsetBounds().max
@@ -2173,8 +2465,7 @@ final class TiledUIView<
     completion: (() -> Void)? = nil
   ) {
     isUserScrollSessionActive = false
-    springAnimator?.stop(finished: false)
-    springAnimator = nil
+    stopScrollAnimation()
     collectionView.setContentOffset(collectionView.contentOffset, animated: false)
 
     if animated {
@@ -2499,8 +2790,7 @@ final class TiledUIView<
       isAnimatingTypingIndicatorRemoval = false
       isTypingIndicatorIncludedInContentBounds = true
       typingIndicatorPhase = .appearing
-      springAnimator?.stop(finished: false)
-      springAnimator = nil
+      stopScrollAnimation()
       reconfigureAccessoryDisplayItem(.typingIndicator)
       remeasureAccessoryDisplayItem(.typingIndicator, positionPreservation: .itemsBeforeMutation)
       updateHiddenEdgeContentInset()
@@ -2616,6 +2906,8 @@ extension TiledUIView {
 
   var test_contentOffsetY: CGFloat { collectionView.contentOffset.y }
 
+  var test_isApplyingItemChanges: Bool { isApplyingItemChanges }
+
   var test_pointsFromBottom: CGFloat { collectionView.tiledScrollGeometry.pointsFromBottom }
 
   /// Layout frame of the message at `index`, in the shared content-offset space.
@@ -2672,6 +2964,9 @@ struct TiledViewRepresentable<
   let items: [Item]
   let makeInitialState: (Item) -> StateValue
   let cellBuilder: (Item, CellReveal?, CellStateStorage<StateValue>) -> Cell
+  let accessibilityHeadingConfiguration: TiledAccessibilityHeadingConfiguration?
+  let onTiledEdgeScrollCompletion: ((TiledEdgeScrollCompletion<Item.ID>) -> Void)?
+  let messageAccessibilityIdentifier: ((Item.ID) -> String)?
   let onTiledScrollGeometryChange: ((TiledScrollGeometry) -> Void)?
   let onTapBackground: (() -> Void)?
   let onDragIntoBottomSafeArea: (() -> Void)?
@@ -2691,6 +2986,9 @@ struct TiledViewRepresentable<
     items: [Item],
     scrollPosition: Binding<TiledScrollPosition>,
     makeInitialState: @escaping (Item) -> StateValue,
+    accessibilityHeadingConfiguration: TiledAccessibilityHeadingConfiguration? = nil,
+    onTiledEdgeScrollCompletion: ((TiledEdgeScrollCompletion<Item.ID>) -> Void)? = nil,
+    messageAccessibilityIdentifier: ((Item.ID) -> String)? = nil,
     onTiledScrollGeometryChange: ((TiledScrollGeometry) -> Void)? = nil,
     onTapBackground: (() -> Void)? = nil,
     onDragIntoBottomSafeArea: (() -> Void)? = nil,
@@ -2709,6 +3007,9 @@ struct TiledViewRepresentable<
     self.items = items
     self._scrollPosition = scrollPosition
     self.makeInitialState = makeInitialState
+    self.accessibilityHeadingConfiguration = accessibilityHeadingConfiguration
+    self.onTiledEdgeScrollCompletion = onTiledEdgeScrollCompletion
+    self.messageAccessibilityIdentifier = messageAccessibilityIdentifier
     self.onTiledScrollGeometryChange = onTiledScrollGeometryChange
     self.onTapBackground = onTapBackground
     self.onDragIntoBottomSafeArea = onDragIntoBottomSafeArea
@@ -2731,6 +3032,10 @@ struct TiledViewRepresentable<
     return view
   }
 
+  static func dismantleUIView(_ uiView: UIViewType, coordinator: ()) {
+    uiView.dismantle()
+  }
+
   func updateUIView(_ uiView: UIViewType, context: Context) {
     if #available(iOS 18.0, *) {
       context.animate {
@@ -2742,6 +3047,9 @@ struct TiledViewRepresentable<
       uiView.swiftUIWorldSafeAreaInset = swiftUIWorldSafeAreaInset
     }
 
+    uiView.accessibilityHeadingConfiguration = accessibilityHeadingConfiguration
+    uiView.onTiledEdgeScrollCompletion = onTiledEdgeScrollCompletion
+    uiView.messageAccessibilityIdentifier = messageAccessibilityIdentifier
     uiView.autoScrollsToBottomOnAppend = scrollPosition.autoScrollsToBottomOnAppend
     uiView.scrollsToBottomOnReplace = scrollPosition.scrollsToBottomOnReplace
     uiView.onTiledScrollGeometryChange = onTiledScrollGeometryChange.map { perform in
@@ -2976,6 +3284,9 @@ public struct TiledView<
   let items: [Item]
   let makeInitialState: (Item) -> StateValue
   let cellBuilder: (Item, CellReveal?, CellStateStorage<StateValue>) -> Cell
+  var accessibilityHeadingConfiguration: TiledAccessibilityHeadingConfiguration?
+  var onTiledEdgeScrollCompletion: ((TiledEdgeScrollCompletion<Item.ID>) -> Void)?
+  var messageAccessibilityIdentifier: ((Item.ID) -> String)?
   var onTiledScrollGeometryChange: ((TiledScrollGeometry) -> Void)?
   var onTapBackground: (() -> Void)?
   var onDragIntoBottomSafeArea: (() -> Void)?
@@ -2995,6 +3306,9 @@ public struct TiledView<
     items: [Item],
     makeInitialState: @escaping (Item) -> StateValue,
     cellBuilder: @escaping (Item, CellReveal?, CellStateStorage<StateValue>) -> Cell,
+    accessibilityHeadingConfiguration: TiledAccessibilityHeadingConfiguration? = nil,
+    onTiledEdgeScrollCompletion: ((TiledEdgeScrollCompletion<Item.ID>) -> Void)? = nil,
+    messageAccessibilityIdentifier: ((Item.ID) -> String)? = nil,
     onTiledScrollGeometryChange: ((TiledScrollGeometry) -> Void)?,
     onTapBackground: (() -> Void)?,
     onDragIntoBottomSafeArea: (() -> Void)?,
@@ -3012,6 +3326,9 @@ public struct TiledView<
     self.items = items
     self.makeInitialState = makeInitialState
     self.cellBuilder = cellBuilder
+    self.accessibilityHeadingConfiguration = accessibilityHeadingConfiguration
+    self.onTiledEdgeScrollCompletion = onTiledEdgeScrollCompletion
+    self.messageAccessibilityIdentifier = messageAccessibilityIdentifier
     self.onTiledScrollGeometryChange = onTiledScrollGeometryChange
     self.onTapBackground = onTapBackground
     self.onDragIntoBottomSafeArea = onDragIntoBottomSafeArea
@@ -3109,6 +3426,9 @@ extension TiledView where PrependLoadingView == Never {
       items: items,
       makeInitialState: makeInitialState,
       cellBuilder: cellBuilder,
+      accessibilityHeadingConfiguration: accessibilityHeadingConfiguration,
+      onTiledEdgeScrollCompletion: onTiledEdgeScrollCompletion,
+      messageAccessibilityIdentifier: messageAccessibilityIdentifier,
       onTiledScrollGeometryChange: onTiledScrollGeometryChange,
       onTapBackground: onTapBackground,
       onDragIntoBottomSafeArea: onDragIntoBottomSafeArea,
@@ -3136,6 +3456,9 @@ extension TiledView where AppendLoadingView == Never {
       items: items,
       makeInitialState: makeInitialState,
       cellBuilder: cellBuilder,
+      accessibilityHeadingConfiguration: accessibilityHeadingConfiguration,
+      onTiledEdgeScrollCompletion: onTiledEdgeScrollCompletion,
+      messageAccessibilityIdentifier: messageAccessibilityIdentifier,
       onTiledScrollGeometryChange: onTiledScrollGeometryChange,
       onTapBackground: onTapBackground,
       onDragIntoBottomSafeArea: onDragIntoBottomSafeArea,
@@ -3163,6 +3486,9 @@ extension TiledView where TypingIndicatorContent == Never {
       items: items,
       makeInitialState: makeInitialState,
       cellBuilder: cellBuilder,
+      accessibilityHeadingConfiguration: accessibilityHeadingConfiguration,
+      onTiledEdgeScrollCompletion: onTiledEdgeScrollCompletion,
+      messageAccessibilityIdentifier: messageAccessibilityIdentifier,
       onTiledScrollGeometryChange: onTiledScrollGeometryChange,
       onTapBackground: onTapBackground,
       onDragIntoBottomSafeArea: onDragIntoBottomSafeArea,
@@ -3190,6 +3516,9 @@ extension TiledView where HeaderContentView == Never {
       items: items,
       makeInitialState: makeInitialState,
       cellBuilder: cellBuilder,
+      accessibilityHeadingConfiguration: accessibilityHeadingConfiguration,
+      onTiledEdgeScrollCompletion: onTiledEdgeScrollCompletion,
+      messageAccessibilityIdentifier: messageAccessibilityIdentifier,
       onTiledScrollGeometryChange: onTiledScrollGeometryChange,
       onTapBackground: onTapBackground,
       onDragIntoBottomSafeArea: onDragIntoBottomSafeArea,
@@ -3230,6 +3559,21 @@ struct TiledSafeAreaPolicy: Equatable {
 
 extension TiledView {
 
+  /// Supplies the accessibility identifier of the message element in each row.
+  /// A bottom-edge command with focus moves VoiceOver to that element.
+  public consuming func accessibilityItemIdentifier(_ makeIdentifier: @escaping (Item.ID) -> String) -> Self {
+    messageAccessibilityIdentifier = makeIdentifier
+    return self
+  }
+
+  /// Navigates the existing heading element in each identified loaded row.
+  public consuming func accessibilityHeadings(_ itemIDs: [Item.ID], onNavigate: @escaping () -> Void) -> Self {
+    accessibilityHeadingConfiguration = TiledAccessibilityHeadingConfiguration(
+      itemIDs: Set(itemIDs.map(AnyHashable.init)), onNavigate: onNavigate
+    )
+    return self
+  }
+
   public var body: some View {
     GeometryReader { proxy in
       // iOS 26 draws under the top bar. Earlier systems keep that edge so
@@ -3243,6 +3587,9 @@ extension TiledView {
         items: items,
         scrollPosition: $scrollPosition,
         makeInitialState: makeInitialState,
+        accessibilityHeadingConfiguration: accessibilityHeadingConfiguration,
+        onTiledEdgeScrollCompletion: onTiledEdgeScrollCompletion,
+        messageAccessibilityIdentifier: messageAccessibilityIdentifier,
         onTiledScrollGeometryChange: onTiledScrollGeometryChange,
         onTapBackground: onTapBackground,
         onDragIntoBottomSafeArea: onDragIntoBottomSafeArea,
@@ -3264,6 +3611,15 @@ extension TiledView {
 }
 
 extension TiledView {
+  /// Reports one consumed explicit edge command on the next main turn.
+  /// Append-follow emits nothing, and dismantling drops a callback already queued.
+  public consuming func onTiledEdgeScrollCompletion(
+    _ action: @escaping (TiledEdgeScrollCompletion<Item.ID>) -> Void
+  ) -> Self {
+    self.onTiledEdgeScrollCompletion = action
+    return self
+  }
+
   public consuming func onTiledScrollGeometryChange(
     _ action: @escaping (TiledScrollGeometry) -> Void
   ) -> Self {

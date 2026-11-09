@@ -63,8 +63,11 @@ public struct TiledScrollPosition: Equatable, @unchecked Sendable {
   /// Whether the scroll should be animated.
   var animated: Bool = true
 
-  /// Version counter for change tracking.
-  private(set) var version: UInt = 0
+  /// A finished bottom-edge command moves VoiceOver to that row's message element.
+  var focusesBottomAccessibilityElement: Bool = false
+
+  /// Version of the latest command, for correlating edge completion.
+  public private(set) var version: UInt = 0
 
   /// Whether to automatically scroll to bottom when new items are appended.
   ///
@@ -103,10 +106,17 @@ public struct TiledScrollPosition: Equatable, @unchecked Sendable {
   /// - Parameters:
   ///   - edge: The edge to scroll to (`.top` or `.bottom`).
   ///   - animated: Whether to animate the scroll. Defaults to `true`.
-  public mutating func scrollTo(edge: Edge, animated: Bool = true) {
+  ///   - focusBottomAccessibilityElement: When the bottom edge finishes, move VoiceOver
+  ///     to the message element supplied by ``TiledView/accessibilityItemIdentifier(_:)``.
+  public mutating func scrollTo(
+    edge: Edge,
+    animated: Bool = true,
+    focusBottomAccessibilityElement: Bool = false
+  ) {
     self.edge = edge
     self.itemID = nil
     self.animated = animated
+    self.focusesBottomAccessibilityElement = focusBottomAccessibilityElement && edge == .bottom
     makeDirty()
   }
 
@@ -126,6 +136,15 @@ public struct TiledScrollPosition: Equatable, @unchecked Sendable {
     self.itemID = AnyHashable(id)
     self.itemAnchor = anchor
     self.animated = animated
+    self.focusesBottomAccessibilityElement = false
+    makeDirty()
+  }
+
+  /// Cancels active or deferred scrolling without selecting a new target.
+  public mutating func cancel() {
+    edge = nil
+    itemID = nil
+    focusesBottomAccessibilityElement = false
     makeDirty()
   }
 
